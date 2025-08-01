@@ -2,8 +2,11 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -136,9 +139,12 @@ func (m *Manager) startRaftMode() error {
 	m.wg.Add(1)
 	go m.heartbeatWorker()
 
-	// Start leader election if bootstrap or no leader
-	if m.config.Bootstrap || len(m.nodes) == 1 {
+	// Only bootstrap node starts as leader, others wait for leader election
+	if m.config.Bootstrap {
 		m.becomeLeader()
+		m.logger.Info("Bootstrap node starting as initial leader")
+	} else {
+		m.logger.Info("Non-bootstrap node waiting for leader election")
 	}
 
 	// Join existing cluster if join addresses are provided
@@ -261,27 +267,86 @@ func (m *Manager) joinCluster() {
 	for _, addr := range m.config.JoinAddresses {
 		m.logger.WithField("address", addr).Info("Attempting to join cluster")
 
-		// In real implementation, you would send a join request to the address
-		// For now, we'll simulate adding nodes
-		nodeID := fmt.Sprintf("node-%s", addr)
-		node := &Node{
-			ID:       nodeID,
-			Address:  addr,
-			Status:   "active",
-			LastSeen: time.Now(),
-			Version:  "1.0.0",
-			Metadata: map[string]string{
-				"role": "sync-node",
-			},
-			JoinedAt: time.Now(),
+		// Real HTTP request to join cluster
+		success := m.sendJoinRequest(addr)
+		if success {
+			// Get cluster status from leader to discover other nodes
+			m.discoverClusterNodes(addr)
+			m.logger.WithField("leader_address", addr).Info("Successfully joined cluster")
+			return
+		} else {
+			m.logger.WithField("address", addr).Warn("Failed to join cluster via this address")
 		}
-
-		m.nodesMutex.Lock()
-		m.nodes[nodeID] = node
-		m.nodesMutex.Unlock()
-
-		m.logger.WithField("node_id", nodeID).Info("Added node to cluster")
 	}
+
+	m.logger.Error("Failed to join cluster via any provided addresses")
+}
+
+// sendJoinRequest sends a real HTTP request to join the cluster
+func (m *Manager) sendJoinRequest(leaderAddr string) bool {
+	// Extract hostname for HTTP request
+	httpAddr := strings.Replace(leaderAddr, ":8082", ":8080", 1)
+
+	joinRequest := map[string]interface{}{
+		"node_id": m.nodeID,
+		"address": m.config.AdvertiseAddr,
+		"version": "1.0.0",
+		"metadata": map[string]string{
+			"role": "sync-node",
+		},
+	}
+
+	payload, err := json.Marshal(joinRequest)
+	if err != nil {
+		m.logger.WithError(err).Error("Failed to marshal join request")
+		return false
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(
+		fmt.Sprintf("http://%s/api/v1/cluster/join", httpAddr),
+		"application/json",
+		strings.NewReader(string(payload)),
+	)
+	if err != nil {
+		m.logger.WithError(err).Error("Failed to send join request")
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		m.logger.Info("Join request accepted by leader")
+		return true
+	} else {
+		m.logger.WithField("status", resp.StatusCode).Error("Join request rejected")
+		return false
+	}
+}
+
+// discoverClusterNodes gets the current cluster state from leader
+func (m *Manager) discoverClusterNodes(leaderAddr string) {
+	httpAddr := strings.Replace(leaderAddr, ":8082", ":8080", 1)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s/api/v1/cluster/status", httpAddr))
+	if err != nil {
+		m.logger.WithError(err).Error("Failed to get cluster status")
+		return
+	}
+	defer resp.Body.Close()
+
+	var clusterStatus map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&clusterStatus); err != nil {
+		m.logger.WithError(err).Error("Failed to decode cluster status")
+		return
+	}
+
+	// Update leader information
+	if leaderID, ok := clusterStatus["leader_id"].(string); ok {
+		m.setLeader(leaderID)
+	}
+
+	m.logger.WithField("cluster_status", clusterStatus).Info("Discovered cluster state")
 }
 
 // performRaftTick performs one Raft consensus tick
@@ -298,7 +363,7 @@ func (m *Manager) performRaftTick() {
 	}
 }
 
-// sendHeartbeat sends heartbeat to all nodes
+// sendHeartbeat sends real heartbeat to all nodes
 func (m *Manager) sendHeartbeat() {
 	m.nodesMutex.RLock()
 	nodes := make([]*Node, 0, len(m.nodes))
@@ -309,9 +374,9 @@ func (m *Manager) sendHeartbeat() {
 	}
 	m.nodesMutex.RUnlock()
 
+	// Send real HTTP heartbeats to all nodes
 	for _, node := range nodes {
-		// In real implementation, send actual heartbeat
-		m.logger.WithField("target_node", node.ID).Debug("Sending heartbeat")
+		go m.sendHeartbeatToNode(node)
 	}
 
 	// Update self last seen
@@ -320,6 +385,51 @@ func (m *Manager) sendHeartbeat() {
 		selfNode.LastSeen = time.Now()
 	}
 	m.nodesMutex.Unlock()
+}
+
+// sendHeartbeatToNode sends a real HTTP heartbeat to a specific node
+func (m *Manager) sendHeartbeatToNode(node *Node) {
+	// Convert Raft address to HTTP address
+	httpAddr := strings.Replace(node.Address, ":8082", ":8080", 1)
+
+	heartbeatData := map[string]interface{}{
+		"leader_id": m.nodeID,
+		"term":      time.Now().Unix(),
+		"timestamp": time.Now().Unix(),
+	}
+
+	payload, err := json.Marshal(heartbeatData)
+	if err != nil {
+		m.logger.WithError(err).WithField("target_node", node.ID).Error("Failed to marshal heartbeat")
+		return
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(
+		fmt.Sprintf("http://%s/api/v1/cluster/heartbeat", httpAddr),
+		"application/json",
+		strings.NewReader(string(payload)),
+	)
+
+	if err != nil {
+		m.logger.WithError(err).WithField("target_node", node.ID).Debug("Failed to send heartbeat")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		// Heartbeat successful - update node's last seen time
+		m.nodesMutex.Lock()
+		if existingNode, exists := m.nodes[node.ID]; exists {
+			existingNode.LastSeen = time.Now()
+			existingNode.Status = "active"
+		}
+		m.nodesMutex.Unlock()
+
+		m.logger.WithField("target_node", node.ID).Debug("Heartbeat successful")
+	} else {
+		m.logger.WithField("target_node", node.ID).WithField("status", resp.StatusCode).Debug("Heartbeat failed")
+	}
 }
 
 // checkNodeHealth checks the health of all nodes

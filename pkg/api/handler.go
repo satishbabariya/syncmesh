@@ -3,7 +3,10 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -52,6 +55,7 @@ func NewHTTPHandler(syncEngine *sync.Engine, clusterManager *cluster.Manager, mo
 			r.Get("/files/{path}", handler.getFileStatus)
 			r.Post("/files/{path}/sync", handler.syncFile)
 			r.Delete("/files/{path}", handler.deleteFile)
+			r.Post("/receive", handler.receiveFile)
 		})
 
 		// Cluster endpoints
@@ -62,6 +66,8 @@ func NewHTTPHandler(syncEngine *sync.Engine, clusterManager *cluster.Manager, mo
 			r.Post("/nodes/{nodeId}/join", handler.joinNode)
 			r.Delete("/nodes/{nodeId}", handler.removeNode)
 			r.Get("/leader", handler.getLeader)
+			r.Post("/join", handler.handleClusterJoin)
+			r.Post("/heartbeat", handler.handleHeartbeat)
 		})
 
 		// Health and monitoring endpoints
@@ -438,4 +444,164 @@ func (h *Handler) getBoolParam(r *http.Request, key string, defaultValue bool) b
 		}
 	}
 	return defaultValue
+}
+
+// handleClusterJoin handles cluster join requests from other nodes
+func (h *Handler) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
+	var joinRequest struct {
+		NodeID   string            `json:"node_id"`
+		Address  string            `json:"address"`
+		Version  string            `json:"version"`
+		Metadata map[string]string `json:"metadata"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&joinRequest); err != nil {
+		h.writeError(w, http.StatusBadRequest, "Invalid join request format")
+		return
+	}
+
+	h.logger.WithFields(logrus.Fields{
+		"node_id": joinRequest.NodeID,
+		"address": joinRequest.Address,
+	}).Info("Received cluster join request")
+
+	// Only allow join if this node is the leader
+	if !h.clusterManager.IsLeader() {
+		h.writeError(w, http.StatusServiceUnavailable, "This node is not the cluster leader")
+		return
+	}
+
+	// Add the new node to the cluster
+	newNode := &cluster.Node{
+		ID:       joinRequest.NodeID,
+		Address:  joinRequest.Address,
+		Status:   "active",
+		LastSeen: time.Now(),
+		Version:  joinRequest.Version,
+		Metadata: joinRequest.Metadata,
+		IsLeader: false,
+		JoinedAt: time.Now(),
+	}
+
+	if err := h.clusterManager.AddNode(newNode); err != nil {
+		h.logger.WithError(err).Error("Failed to add node to cluster")
+		h.writeError(w, http.StatusInternalServerError, "Failed to add node to cluster")
+		return
+	}
+
+	response := map[string]interface{}{
+		"success":   true,
+		"message":   "Node successfully joined cluster",
+		"leader_id": h.clusterManager.GetLeaderID(),
+		"timestamp": time.Now().UTC(),
+	}
+
+	h.writeJSON(w, http.StatusOK, response)
+}
+
+// handleHeartbeat handles heartbeat requests from other nodes
+func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var heartbeatRequest struct {
+		LeaderID  string `json:"leader_id"`
+		Term      int64  `json:"term"`
+		Timestamp int64  `json:"timestamp"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&heartbeatRequest); err != nil {
+		h.writeError(w, http.StatusBadRequest, "Invalid heartbeat format")
+		return
+	}
+
+	h.logger.WithField("leader_id", heartbeatRequest.LeaderID).Debug("Received heartbeat")
+
+	// Accept the heartbeat and update leader information if needed
+	currentLeader := h.clusterManager.GetLeaderID()
+	if currentLeader == "" || currentLeader != heartbeatRequest.LeaderID {
+		h.logger.WithField("new_leader", heartbeatRequest.LeaderID).Info("Updating cluster leader from heartbeat")
+		// In a real Raft implementation, you would validate the term and other Raft logic
+	}
+
+	response := map[string]interface{}{
+		"success":   true,
+		"node_id":   h.clusterManager.GetNodeID(),
+		"timestamp": time.Now().Unix(),
+	}
+
+	h.writeJSON(w, http.StatusOK, response)
+}
+
+// receiveFile handles file synchronization from other nodes
+func (h *Handler) receiveFile(w http.ResponseWriter, r *http.Request) {
+	h.logger.Info("Received file sync request from another node")
+
+	// Parse multipart form
+	if err := r.ParseMultipartForm(100 << 20); err != nil { // 100 MB limit
+		h.writeError(w, http.StatusBadRequest, "Failed to parse multipart form")
+		return
+	}
+
+	// Get metadata from form
+	operation := r.FormValue("operation")
+	filePath := r.FormValue("path")
+	checksum := r.FormValue("checksum")
+
+	if filePath == "" || operation == "" {
+		h.writeError(w, http.StatusBadRequest, "Missing required fields: path, operation")
+		return
+	}
+
+	h.logger.WithFields(logrus.Fields{
+		"file":      filePath,
+		"operation": operation,
+		"checksum":  checksum,
+	}).Info("Processing received file")
+
+	// Get the uploaded file
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "Failed to get uploaded file")
+		return
+	}
+	defer file.Close()
+
+	// Ensure the directory exists
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		h.logger.WithError(err).Error("Failed to create directory")
+		h.writeError(w, http.StatusInternalServerError, "Failed to create directory")
+		return
+	}
+
+	// Create the destination file
+	destFile, err := os.Create(filePath)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to create destination file")
+		h.writeError(w, http.StatusInternalServerError, "Failed to create file")
+		return
+	}
+	defer destFile.Close()
+
+	// Copy the file content
+	bytesWritten, err := io.Copy(destFile, file)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to write file content")
+		h.writeError(w, http.StatusInternalServerError, "Failed to write file")
+		return
+	}
+
+	h.logger.WithFields(logrus.Fields{
+		"file":          filePath,
+		"bytes_written": bytesWritten,
+		"original_name": header.Filename,
+	}).Info("Successfully received and saved file")
+
+	response := map[string]interface{}{
+		"success":       true,
+		"file":          filePath,
+		"bytes_written": bytesWritten,
+		"operation":     operation,
+		"timestamp":     time.Now().UTC(),
+	}
+
+	h.writeJSON(w, http.StatusOK, response)
 }

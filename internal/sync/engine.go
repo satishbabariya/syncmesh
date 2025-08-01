@@ -1,14 +1,19 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"io"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -380,15 +385,149 @@ func (e *Engine) processSyncTask(task SyncTask) error {
 
 // syncToNode synchronizes a file to a specific node
 func (e *Engine) syncToNode(event FileEvent, nodeID string) error {
-	// This would typically use gRPC to send the file to the target node
-	// For now, we'll log the operation
 	e.logger.WithFields(logrus.Fields{
 		"file":      event.Path,
 		"node":      nodeID,
 		"operation": event.Operation,
 	}).Info("Syncing file to node")
 
-	// TODO: Implement actual gRPC call to sync file
+	// Get node information from cluster manager
+	nodes := e.clusterManager.GetNodes()
+	targetNode, exists := nodes[nodeID]
+	if !exists {
+		return fmt.Errorf("target node %s not found in cluster", nodeID)
+	}
+
+	// Convert cluster address to HTTP address
+	httpAddr := strings.Replace(targetNode.Address, ":8082", ":8080", 1)
+
+	switch event.Operation {
+	case "create", "modify":
+		return e.sendFileToNode(httpAddr, event)
+	case "delete":
+		return e.deleteFileOnNode(httpAddr, event)
+	default:
+		return fmt.Errorf("unsupported operation: %s", event.Operation)
+	}
+}
+
+// sendFileToNode sends a file to another node via HTTP
+func (e *Engine) sendFileToNode(nodeAddr string, event FileEvent) error {
+	// Check if file exists and get its info
+	fileInfo, err := os.Stat(event.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			e.logger.WithField("file", event.Path).Warn("File no longer exists, skipping sync")
+			return nil
+		}
+		return fmt.Errorf("failed to stat file %s: %w", event.Path, err)
+	}
+
+	// Open the file for reading
+	file, err := os.Open(event.Path)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %w", event.Path, err)
+	}
+	defer file.Close()
+
+	// Create multipart form
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+
+	// Add file metadata
+	if err := writer.WriteField("operation", event.Operation); err != nil {
+		return err
+	}
+	if err := writer.WriteField("path", event.Path); err != nil {
+		return err
+	}
+	if err := writer.WriteField("checksum", event.Checksum); err != nil {
+		return err
+	}
+	if err := writer.WriteField("size", fmt.Sprintf("%d", event.Size)); err != nil {
+		return err
+	}
+	if err := writer.WriteField("timestamp", fmt.Sprintf("%d", event.Timestamp.Unix())); err != nil {
+		return err
+	}
+
+	// Add the file content
+	part, err := writer.CreateFormFile("file", filepath.Base(event.Path))
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(part, file); err != nil {
+		return err
+	}
+
+	if err := writer.Close(); err != nil {
+		return err
+	}
+
+	// Send HTTP request
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/api/v1/sync/receive", nodeAddr), &body)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send file to node %s: %w", nodeAddr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("file sync failed on node %s: HTTP %d", nodeAddr, resp.StatusCode)
+	}
+
+	e.logger.WithFields(logrus.Fields{
+		"file": event.Path,
+		"node": nodeAddr,
+		"size": fileInfo.Size(),
+	}).Info("Successfully synced file to node")
+
+	return nil
+}
+
+// deleteFileOnNode sends a delete request to another node
+func (e *Engine) deleteFileOnNode(nodeAddr string, event FileEvent) error {
+	deleteRequest := map[string]interface{}{
+		"operation": "delete",
+		"path":      event.Path,
+		"timestamp": event.Timestamp.Unix(),
+	}
+
+	payload, err := json.Marshal(deleteRequest)
+	if err != nil {
+		return err
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s/api/v1/sync/files%s", nodeAddr, event.Path), bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete file on node %s: %w", nodeAddr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("file delete failed on node %s: HTTP %d", nodeAddr, resp.StatusCode)
+	}
+
+	e.logger.WithFields(logrus.Fields{
+		"file": event.Path,
+		"node": nodeAddr,
+	}).Info("Successfully deleted file on node")
 
 	return nil
 }
