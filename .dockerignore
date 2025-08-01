@@ -1,0 +1,60 @@
+# Git and version control
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+README.md
+ARCHITECTURE.md
+LICENSE
+
+# Build artifacts and temporary files
+zig-out/
+zig-cache/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# Test data and logs
+test-data/
+test-logs/
+test-config/
+test-scripts/
+cluster-nodes/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker files (except Dockerfile)
+docker-compose*.yml
+.dockerignore
+
+# Development and CI files
+.github/
+.gitlab-ci.yml
+.travis.yml
+.circleci/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

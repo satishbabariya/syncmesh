@@ -1,43 +1,21 @@
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
 
-# Test binary, built with `go test -c`
-*.test
+# Backup files
+*.bak
+*.backup
+*.tmp
 
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
-
-# Go workspace file
-go.work
-
-# Build artifacts
-syncmesh
-gluster-cluster
-dist/
-build/
-
-# Data directories
-data/
-logs/
-*.log
-
-# Configuration overrides
-config.local.yaml
-.env
-.env.local
-
-# IDE specific files
+# Editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS specific files
+# OS generated files
 .DS_Store
 .DS_Store?
 ._*
@@ -46,26 +24,45 @@ config.local.yaml
 ehthumbs.db
 Thumbs.db
 
-# Docker volumes and temporary files
-volumes/
-temp/
-tmp/
-
-# Coverage files
-coverage.out
-coverage.html
+# Logs
+*.log
+logs/
 
 # Test artifacts
-*.coverage
-test_results/
+test-results/
+coverage/
 
-# Certificates and keys
-*.pem
-*.key
-*.crt
-*.p12
-*.pfx
+# Documentation build
+docs/_build/
+docs/.build/
 
-# Local development
-docker-compose.override.yml
-docker-compose.local.yml
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Temporary directories
+tmp/
+temp/
+
+# Binary files (but allow specific ones in assets if needed)
+*.bin
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Compile commands for editors
+compile_commands.json
+compile_flags.txt
+
+# Build configuration
+build.zig.zon.lock
+
+# Runtime files
+*.pid
+*.sock
+
+# SyncMesh specific
+syncmesh-data/
+sync-test/
