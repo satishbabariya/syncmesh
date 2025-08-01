@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -471,7 +472,7 @@ func (h *Handler) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Add the new node to the cluster
+	// Add or update the node in the cluster
 	newNode := &cluster.Node{
 		ID:       joinRequest.NodeID,
 		Address:  joinRequest.Address,
@@ -484,9 +485,19 @@ func (h *Handler) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.clusterManager.AddNode(newNode); err != nil {
-		h.logger.WithError(err).Error("Failed to add node to cluster")
-		h.writeError(w, http.StatusInternalServerError, "Failed to add node to cluster")
-		return
+		// If node already exists, update it instead of failing
+		if strings.Contains(err.Error(), "already exists") {
+			h.logger.WithField("node_id", joinRequest.NodeID).Info("Node already exists, updating it")
+			if updateErr := h.clusterManager.UpdateNodeStatus(joinRequest.NodeID, "active"); updateErr != nil {
+				h.logger.WithError(updateErr).Error("Failed to update existing node")
+				h.writeError(w, http.StatusInternalServerError, "Failed to update existing node")
+				return
+			}
+		} else {
+			h.logger.WithError(err).Error("Failed to add node to cluster")
+			h.writeError(w, http.StatusInternalServerError, "Failed to add node to cluster")
+			return
+		}
 	}
 
 	response := map[string]interface{}{
@@ -501,24 +512,48 @@ func (h *Handler) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 
 // handleHeartbeat handles heartbeat requests from other nodes
 func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	var heartbeatRequest struct {
-		LeaderID  string `json:"leader_id"`
-		Term      int64  `json:"term"`
-		Timestamp int64  `json:"timestamp"`
+	// Read the raw body first to log it
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "Failed to read request body")
+		return
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&heartbeatRequest); err != nil {
+	h.logger.WithField("heartbeat_payload", string(bodyBytes)).Info("Raw heartbeat received")
+
+	var heartbeatRequest struct {
+		LeaderID  string                   `json:"leader_id"`
+		Term      int64                    `json:"term"`
+		Timestamp int64                    `json:"timestamp"`
+		Nodes     []map[string]interface{} `json:"nodes"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &heartbeatRequest); err != nil {
+		h.logger.WithError(err).Error("Failed to parse heartbeat JSON")
 		h.writeError(w, http.StatusBadRequest, "Invalid heartbeat format")
 		return
 	}
 
-	h.logger.WithField("leader_id", heartbeatRequest.LeaderID).Debug("Received heartbeat")
+	h.logger.WithFields(logrus.Fields{
+		"leader_id":   heartbeatRequest.LeaderID,
+		"nodes_count": len(heartbeatRequest.Nodes),
+		"has_nodes":   heartbeatRequest.Nodes != nil,
+	}).Info("Received heartbeat with cluster data")
 
 	// Accept the heartbeat and update leader information if needed
 	currentLeader := h.clusterManager.GetLeaderID()
 	if currentLeader == "" || currentLeader != heartbeatRequest.LeaderID {
 		h.logger.WithField("new_leader", heartbeatRequest.LeaderID).Info("Updating cluster leader from heartbeat")
 		// In a real Raft implementation, you would validate the term and other Raft logic
+	}
+
+	// Update cluster membership from heartbeat data
+	if len(heartbeatRequest.Nodes) > 0 {
+		h.logger.WithField("nodes_data", heartbeatRequest.Nodes).Info("Processing nodes from heartbeat")
+		h.clusterManager.UpdateNodesFromHeartbeat(heartbeatRequest.LeaderID, heartbeatRequest.Nodes)
+		h.logger.WithField("node_count", len(heartbeatRequest.Nodes)).Info("Updated cluster membership from heartbeat")
+	} else {
+		h.logger.Warn("Heartbeat received but no nodes data included")
 	}
 
 	response := map[string]interface{}{
