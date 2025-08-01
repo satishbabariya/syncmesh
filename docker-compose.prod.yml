@@ -1,18 +1,9 @@
 version: '3.8'
 
-# Development docker-compose configuration
-# This file builds the SyncMesh application from source for development and testing.
-# 
-# For production or quick start with pre-built images, use:
-#   docker-compose -f docker-compose.prod.yml up -d
-#
-# For development with local builds, use:
-#   docker-compose up -d
-
 services:
   # Node 1 - Bootstrap node
   syncmesh-node1:
-    build: .
+    image: ghcr.io/satishbabariya/syncmesh:latest
     hostname: syncmesh-node1
     container_name: syncmesh-node1
     ports:
@@ -41,7 +32,7 @@ services:
 
   # Node 2 - Follower node
   syncmesh-node2:
-    build: .
+    image: ghcr.io/satishbabariya/syncmesh:latest
     hostname: syncmesh-node2
     container_name: syncmesh-node2
     ports:
@@ -73,7 +64,7 @@ services:
 
   # Node 3 - Follower node
   syncmesh-node3:
-    build: .
+    image: ghcr.io/satishbabariya/syncmesh:latest
     hostname: syncmesh-node3
     container_name: syncmesh-node3
     ports:

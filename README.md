@@ -3,6 +3,7 @@
 [![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](Dockerfile)
+[![Docker Image](https://img.shields.io/badge/Docker%20Image-ghcr.io-blue.svg)](https://ghcr.io/satishbabariya/syncmesh)
 [![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen.svg)]()
 [![Performance](https://img.shields.io/badge/Performance-Enterprise%20Ready-success.svg)]()
 
@@ -56,19 +57,52 @@ SyncMesh is a high-performance, enterprise-ready distributed file synchronizatio
 - 4GB+ RAM recommended
 - Network connectivity between nodes
 
+### Using Pre-built Docker Image
+
+**Quick start with the published image**:
+```bash
+# Pull the latest image
+docker pull ghcr.io/satishbabariya/syncmesh:latest
+
+# Run a single node
+docker run -d \
+  --name syncmesh \
+  -p 8080:8080 \
+  -p 8081:8081 \
+  -p 8082:8082 \
+  -p 9090:9090 \
+  -v syncmesh_data:/app/data \
+  ghcr.io/satishbabariya/syncmesh:latest
+
+# Check if it's running
+curl http://localhost:8080/api/v1/health
+```
+
+**Available image tags**:
+- `ghcr.io/satishbabariya/syncmesh:latest` - Latest stable release
+- `ghcr.io/satishbabariya/syncmesh:v1.0.0` - Specific version (replace with actual version)
+- `ghcr.io/satishbabariya/syncmesh:main` - Latest development build
+
 ### Using Docker Compose
 
-1. **Clone and start the cluster**:
-   ```bash
-   git clone https://github.com/satishbabariya/syncmesh.git
-   cd syncmesh
-   docker-compose up -d
-   ```
+**Option 1: Quick start with pre-built images (Recommended)**:
+```bash
+git clone https://github.com/satishbabariya/syncmesh.git
+cd syncmesh
+docker-compose -f docker-compose.prod.yml up -d
+```
 
-2. **Verify cluster health**:
-   ```bash
-   curl http://localhost:8080/api/v1/health
-   ```
+**Option 2: Development with local build**:
+```bash
+git clone https://github.com/satishbabariya/syncmesh.git
+cd syncmesh
+docker-compose up -d
+```
+
+**Verify cluster health**:
+```bash
+curl http://localhost:8080/api/v1/health
+```
 
 3. **Check cluster status**:
    ```bash
@@ -283,7 +317,7 @@ spec:
     spec:
       containers:
       - name: syncmesh
-        image: syncmesh:latest
+        image: ghcr.io/satishbabariya/syncmesh:latest
         ports:
         - containerPort: 8080
         - containerPort: 8081
