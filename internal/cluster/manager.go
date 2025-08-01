@@ -470,7 +470,10 @@ func (m *Manager) refreshClusterMembership() {
 		return // No leader or we are the leader
 	}
 
-	m.logger.Info("Refreshing cluster membership from leader")
+	m.logger.WithFields(logrus.Fields{
+		"leader_id":     leaderID,
+		"current_nodes": len(m.nodes),
+	}).Info("🔄 REFRESH: Starting cluster membership refresh from leader")
 
 	// Find leader address
 	m.nodesMutex.RLock()
@@ -487,35 +490,39 @@ func (m *Manager) refreshClusterMembership() {
 		// Try to use join addresses as fallback
 		if len(m.config.JoinAddresses) > 0 {
 			leaderAddr = m.config.JoinAddresses[0]
+			m.logger.WithField("fallback_addr", leaderAddr).Info("🔄 REFRESH: Using join address as fallback")
 		} else {
-			m.logger.Warn("No leader address found for membership refresh")
+			m.logger.Warn("🔄 REFRESH: No leader address found for membership refresh")
 			return
 		}
 	}
 
 	// Get cluster nodes from leader
 	httpAddr := strings.Replace(leaderAddr, ":8082", ":8080", 1)
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 
 	resp, err := client.Get(fmt.Sprintf("http://%s/api/v1/cluster/nodes", httpAddr))
 	if err != nil {
-		m.logger.WithError(err).Error("Failed to refresh cluster nodes from leader")
+		m.logger.WithError(err).Error("🔄 REFRESH: Failed to refresh cluster nodes from leader")
 		return
 	}
 	defer resp.Body.Close()
 
 	var nodesData map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&nodesData); err != nil {
-		m.logger.WithError(err).Error("Failed to decode cluster nodes during refresh")
+		m.logger.WithError(err).Error("🔄 REFRESH: Failed to decode cluster nodes during refresh")
 		return
 	}
 
+	m.logger.WithField("nodes_response", nodesData).Info("🔄 REFRESH: Received cluster nodes from leader")
+
 	// Extract and update nodes
 	if nodesArray, ok := nodesData["nodes"].([]interface{}); ok {
-		m.logger.WithField("refreshed_nodes", len(nodesArray)).Info("Processing refreshed cluster membership")
+		m.logger.WithField("refreshed_nodes", len(nodesArray)).Info("🔄 REFRESH: Processing refreshed cluster membership")
 		m.updateClusterMembership(nodesArray)
+		m.logger.WithField("final_nodes", len(m.nodes)).Info("🔄 REFRESH: Completed cluster membership refresh")
 	} else {
-		m.logger.Error("Failed to extract nodes array during membership refresh")
+		m.logger.WithField("nodes_data", nodesData).Error("🔄 REFRESH: Failed to extract nodes array during membership refresh")
 	}
 }
 
@@ -531,8 +538,9 @@ func (m *Manager) performRaftTick() {
 			m.startLeaderElection()
 		}
 
-		// Refresh cluster membership from leader every tick if we don't have full membership
-		if len(m.nodes) < 2 { // We should at least know about ourselves and the leader
+		// Aggressively refresh cluster membership if we don't have full membership
+		// Also refresh periodically to ensure we stay in sync
+		if len(m.nodes) < 2 || time.Now().Unix()%5 == 0 { // Every 5 ticks (~15 seconds)
 			m.refreshClusterMembership()
 		}
 	}
@@ -853,14 +861,31 @@ func (m *Manager) UpdateNodeStatus(nodeID, status string) error {
 
 // UpdateNodesFromHeartbeat updates the cluster membership from heartbeat data
 func (m *Manager) UpdateNodesFromHeartbeat(leaderID string, nodeData []map[string]interface{}) {
+	m.logger.WithFields(logrus.Fields{
+		"leader_id":     leaderID,
+		"node_data_len": len(nodeData),
+		"current_nodes": len(m.nodes),
+	}).Info("🔄 HEARTBEAT: Starting cluster membership update")
+
 	m.nodesMutex.Lock()
 	defer m.nodesMutex.Unlock()
 
 	// Update leader information
 	m.leaderMutex.Lock()
+	oldLeaderID := m.leaderID
+	oldIsLeader := m.isLeader
 	m.leaderID = leaderID
 	m.isLeader = (leaderID == m.nodeID)
 	m.leaderMutex.Unlock()
+
+	if oldLeaderID != leaderID || oldIsLeader != m.isLeader {
+		m.logger.WithFields(logrus.Fields{
+			"old_leader":    oldLeaderID,
+			"new_leader":    leaderID,
+			"old_is_leader": oldIsLeader,
+			"new_is_leader": m.isLeader,
+		}).Info("🔄 HEARTBEAT: Leader information updated")
+	}
 
 	// Update cluster membership (but preserve self node)
 	newNodes := make(map[string]*Node)
@@ -868,13 +893,34 @@ func (m *Manager) UpdateNodesFromHeartbeat(leaderID string, nodeData []map[strin
 	// Keep self node
 	if selfNode, exists := m.nodes[m.nodeID]; exists {
 		newNodes[m.nodeID] = selfNode
+		m.logger.WithField("self_node", m.nodeID).Debug("🔄 HEARTBEAT: Preserved self node")
+	} else {
+		// Create self node if missing
+		newNodes[m.nodeID] = &Node{
+			ID:       m.nodeID,
+			Address:  "0.0.0.0:8082",
+			Status:   "active",
+			LastSeen: time.Now(),
+			IsLeader: m.isLeader,
+			Version:  "1.0.0",
+			Metadata: map[string]string{"role": "sync-node"},
+			JoinedAt: time.Now(),
+		}
+		m.logger.WithField("self_node", m.nodeID).Info("🔄 HEARTBEAT: Created missing self node")
 	}
 
 	// Add nodes from heartbeat
-	for _, nodeInfo := range nodeData {
+	processedNodes := 0
+	for i, nodeInfo := range nodeData {
 		nodeID, ok := nodeInfo["id"].(string)
-		if !ok || nodeID == m.nodeID {
-			continue // Skip invalid or self nodes
+		if !ok {
+			m.logger.WithField("node_index", i).Warn("🔄 HEARTBEAT: Failed to extract node ID")
+			continue
+		}
+
+		if nodeID == m.nodeID {
+			m.logger.WithField("node_id", nodeID).Debug("🔄 HEARTBEAT: Skipping self node")
+			continue // Skip self nodes
 		}
 
 		address, _ := nodeInfo["address"].(string)
@@ -896,8 +942,13 @@ func (m *Manager) UpdateNodesFromHeartbeat(leaderID string, nodeData []map[strin
 			existingNode.LastSeen = lastSeen
 			existingNode.IsLeader = isLeader
 			newNodes[nodeID] = existingNode
+			m.logger.WithFields(logrus.Fields{
+				"node_id":   nodeID,
+				"address":   address,
+				"is_leader": isLeader,
+			}).Debug("🔄 HEARTBEAT: Updated existing node")
 		} else {
-			newNodes[nodeID] = &Node{
+			newNode := &Node{
 				ID:       nodeID,
 				Address:  address,
 				Status:   status,
@@ -907,7 +958,14 @@ func (m *Manager) UpdateNodesFromHeartbeat(leaderID string, nodeData []map[strin
 				Metadata: map[string]string{"role": "sync-node"},
 				JoinedAt: time.Now(),
 			}
+			newNodes[nodeID] = newNode
+			m.logger.WithFields(logrus.Fields{
+				"node_id":   nodeID,
+				"address":   address,
+				"is_leader": isLeader,
+			}).Info("🔄 HEARTBEAT: Added new node")
 		}
+		processedNodes++
 	}
 
 	// Replace the node list
@@ -915,13 +973,20 @@ func (m *Manager) UpdateNodesFromHeartbeat(leaderID string, nodeData []map[strin
 	m.nodes = newNodes
 	newCount := len(m.nodes)
 
-	if newCount != oldCount {
-		m.logger.WithFields(logrus.Fields{
-			"old_count": oldCount,
-			"new_count": newCount,
-			"leader_id": leaderID,
-		}).Info("Updated cluster membership from heartbeat")
+	m.logger.WithFields(logrus.Fields{
+		"old_count":       oldCount,
+		"new_count":       newCount,
+		"processed_nodes": processedNodes,
+		"leader_id":       leaderID,
+		"is_leader":       m.isLeader,
+	}).Info("🔄 HEARTBEAT: Completed cluster membership update")
+
+	// Log final node list for verification
+	nodeList := make([]string, 0, len(m.nodes))
+	for id := range m.nodes {
+		nodeList = append(nodeList, id)
 	}
+	m.logger.WithField("final_nodes", nodeList).Info("🔄 HEARTBEAT: Final cluster nodes")
 }
 
 // Health returns the health status of the cluster manager
