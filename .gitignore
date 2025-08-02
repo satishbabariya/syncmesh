@@ -15,8 +15,6 @@
 go.work
 
 # Build artifacts
-syncmesh
-gluster-cluster
 dist/
 build/
 
