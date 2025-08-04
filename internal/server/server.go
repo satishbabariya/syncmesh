@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/satishbabariya/syncmesh/internal/config"
 	"github.com/satishbabariya/syncmesh/internal/docker"
-	"github.com/satishbabariya/syncmesh/internal/logger"
 	"github.com/satishbabariya/syncmesh/internal/monitoring"
 	"github.com/satishbabariya/syncmesh/internal/p2p"
+	"github.com/satishbabariya/syncmesh/internal/sync"
 	"github.com/satishbabariya/syncmesh/pkg/api"
 	"github.com/satishbabariya/syncmesh/pkg/grpc"
 	"github.com/sirupsen/logrus"
@@ -20,57 +19,69 @@ import (
 
 // Server represents the main application server
 type Server struct {
-	config *config.Config
-	logger *logrus.Entry
-
-	// Core components
-	p2pNode      *p2p.P2PNode
+	config       *config.Config
 	dockerClient *docker.Client
+	p2pNode      *p2p.P2PNode
+	syncEngine   *sync.Engine
 	monitoring   *monitoring.Service
-
-	// Network components
-	httpServer *http.Server
-	grpcServer *grpc.Server
-
-	// Lifecycle management
-	wg       sync.WaitGroup
-	shutdown chan struct{}
-	mu       sync.RWMutex
-	running  bool
+	httpServer   *http.Server
+	grpcServer   *grpc.Server
+	logger       *logrus.Entry
 }
 
 // New creates a new server instance
-func New(cfg *config.Config) (*Server, error) {
-	log := logger.NewForComponent("server")
-
-	s := &Server{
-		config:   cfg,
-		logger:   log,
-		shutdown: make(chan struct{}),
+func New(config *config.Config) *Server {
+	// Create Docker client
+	dockerClient, err := docker.NewClient(config.Docker)
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to create Docker client")
 	}
 
-	// Initialize components
-	if err := s.initializeComponents(); err != nil {
-		return nil, fmt.Errorf("failed to initialize components: %w", err)
+	// Create monitoring service
+	monitoringService, err := monitoring.NewService(&config.Monitoring)
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to create monitoring service")
 	}
 
-	return s, nil
+	// Create P2P node
+	p2pNode := p2p.NewP2PNode(&config.P2P, dockerClient)
+
+	// Create sync engine
+	syncConfig := &sync.Config{
+		WatchedPaths:       config.Sync.WatchedPaths,
+		ExcludePatterns:    config.Sync.ExcludePatterns,
+		IncludePatterns:    config.Sync.IncludePatterns,
+		SyncInterval:       config.Sync.Interval,
+		BatchSize:          config.Sync.BatchSize,
+		MaxRetries:         config.Sync.MaxRetries,
+		RetryBackoff:       config.Sync.RetryBackoff,
+		ConflictResolution: config.Sync.ConflictResolution,
+		ChecksumAlgorithm:  config.Sync.ChecksumAlgorithm,
+		CompressionEnabled: config.Sync.CompressionEnabled,
+		CompressionLevel:   config.Sync.CompressionLevel,
+	}
+	syncEngine := sync.NewEngine(syncConfig, p2pNode)
+
+	server := &Server{
+		config:       config,
+		dockerClient: dockerClient,
+		p2pNode:      p2pNode,
+		syncEngine:   syncEngine,
+		monitoring:   monitoringService,
+		httpServer:   nil,
+		grpcServer:   nil,
+		logger:       logrus.NewEntry(logrus.New()),
+	}
+
+	return server
 }
 
 // Start starts the server and all its components
 func (s *Server) Start(ctx context.Context) error {
-	s.mu.Lock()
-	if s.running {
-		s.mu.Unlock()
-		return fmt.Errorf("server is already running")
-	}
-	s.running = true
-	s.mu.Unlock()
-
 	s.logger.Info("Starting SyncMesh P2P server")
 
 	// Start components in order
-	if err := s.startComponents(ctx); err != nil {
+	if err := s.startComponents(); err != nil {
 		return fmt.Errorf("failed to start components: %w", err)
 	}
 
@@ -80,37 +91,21 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	s.logger.WithFields(logrus.Fields{
-		"node_id":   s.config.NodeID,
 		"http_port": s.config.Server.Port,
 		"grpc_port": s.config.Server.GRPCPort,
 		"p2p_port":  s.config.P2P.Port,
 	}).Info("Server started successfully")
 
-	// Wait for shutdown signal
-	select {
-	case <-ctx.Done():
-		s.logger.Info("Context cancelled, shutting down")
-	case <-s.shutdown:
-		s.logger.Info("Shutdown signal received")
-	}
+	// Wait for context cancellation
+	<-ctx.Done()
+	s.logger.Info("Context cancelled, shutting down")
 
 	return s.Stop()
 }
 
 // Stop gracefully stops the server
 func (s *Server) Stop() error {
-	s.mu.Lock()
-	if !s.running {
-		s.mu.Unlock()
-		return nil
-	}
-	s.running = false
-	s.mu.Unlock()
-
 	s.logger.Info("Stopping server")
-
-	// Close shutdown channel
-	close(s.shutdown)
 
 	// Stop network services
 	s.stopNetworkServices()
@@ -118,47 +113,24 @@ func (s *Server) Stop() error {
 	// Stop components
 	s.stopComponents()
 
-	// Wait for all goroutines to finish
-	s.wg.Wait()
-
 	s.logger.Info("Server stopped successfully")
 	return nil
 }
 
-// initializeComponents initializes all server components
-func (s *Server) initializeComponents() error {
-	var err error
-
-	// Initialize Docker client
-	s.dockerClient, err = docker.NewClient(s.config.Docker)
-	if err != nil {
-		return fmt.Errorf("failed to create Docker client: %w", err)
-	}
-
-	// Initialize monitoring service
-	s.monitoring, err = monitoring.NewService(&s.config.Monitoring)
-	if err != nil {
-		return fmt.Errorf("failed to create monitoring service: %w", err)
-	}
-
-	// Initialize P2P node
-	s.p2pNode, err = p2p.NewP2PNode(&s.config.P2P, s.dockerClient)
-	if err != nil {
-		return fmt.Errorf("failed to create P2P node: %w", err)
-	}
-
-	return nil
-}
-
 // startComponents starts all server components
-func (s *Server) startComponents(ctx context.Context) error {
+func (s *Server) startComponents() error {
 	// Start P2P node
-	if err := s.p2pNode.Start(ctx); err != nil {
+	if err := s.p2pNode.Start(); err != nil {
 		return fmt.Errorf("failed to start P2P node: %w", err)
 	}
 
+	// Start sync engine
+	if err := s.syncEngine.Start(context.Background()); err != nil {
+		return fmt.Errorf("failed to start sync engine: %w", err)
+	}
+
 	// Start monitoring service
-	if err := s.monitoring.Start(ctx); err != nil {
+	if err := s.monitoring.Start(context.Background()); err != nil {
 		return fmt.Errorf("failed to start monitoring service: %w", err)
 	}
 
@@ -216,7 +188,7 @@ func (s *Server) stopNetworkServices() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.httpServer.Shutdown(ctx); err != nil {
-			s.logger.WithError(err).Error("Failed to gracefully shutdown HTTP server")
+			s.logger.WithError(err).Error("Failed to shutdown HTTP server")
 		}
 	}
 
@@ -227,37 +199,32 @@ func (s *Server) stopNetworkServices() {
 }
 
 // stopComponents stops all server components
-func (s *Server) stopComponents() {
-	if s.monitoring != nil {
-		s.monitoring.Stop()
+func (s *Server) stopComponents() error {
+	// Stop sync engine
+	s.syncEngine.Stop()
+
+	// Stop P2P node
+	if err := s.p2pNode.Stop(); err != nil {
+		s.logger.WithError(err).Error("Failed to stop P2P node")
 	}
 
-	if s.p2pNode != nil {
-		s.p2pNode.Stop()
-	}
+	// Stop monitoring service
+	s.monitoring.Stop()
 
-	if s.dockerClient != nil {
-		s.dockerClient.Close()
-	}
+	return nil
 }
 
-// Health returns the health status of all components
+// Health returns the health status of the server
 func (s *Server) Health() map[string]interface{} {
-	health := map[string]interface{}{
-		"status":    "healthy",
-		"timestamp": time.Now().UTC(),
+	return map[string]interface{}{
+		"status": "healthy",
+		"p2p":    s.p2pNode.Health(),
+		"sync": map[string]interface{}{
+			"watched_paths": s.syncEngine.GetWatchedPaths(),
+			"running":       true,
+		},
+		"monitoring": map[string]interface{}{
+			"status": "healthy",
+		},
 	}
-
-	// Add component health status
-	if s.p2pNode != nil {
-		health["p2p"] = s.p2pNode.Health()
-	}
-
-	if s.monitoring != nil {
-		health["monitoring"] = map[string]interface{}{
-			"running": s.monitoring != nil,
-		}
-	}
-
-	return health
 }

@@ -148,8 +148,10 @@ func (c *ClusterProtocol) handleMessages() {
 			// Process cluster messages
 			c.processClusterMessage(&ClusterMessage{
 				Type:      "heartbeat",
-				PeerID:    c.node.host.ID().String(),
-				Timestamp: time.Now().Unix(),
+				PeerID:    c.node.pubsub.GetHostID(),
+				LeaderID:  c.node.clusterState.Leader,
+				Timestamp: time.Now(),
+				Metadata:  make(map[string]interface{}),
 			})
 		}
 	}
@@ -179,36 +181,40 @@ func (c *ClusterProtocol) processClusterMessage(msg *ClusterMessage) {
 
 // handleHeartbeat handles heartbeat messages
 func (c *ClusterProtocol) handleHeartbeat(msg *ClusterMessage) {
-	peerID := peer.ID(msg.PeerID)
+	c.node.stateMutex.Lock()
+	defer c.node.stateMutex.Unlock()
 
-	// Update peer status
-	c.node.updatePeerStatus(peerID, "active")
-
-	// If this is a leader heartbeat, update leader information
-	if peerID == c.GetLeader() {
-		c.node.stateMutex.Lock()
-		c.node.clusterState.LastUpdate = time.Now()
-		c.node.stateMutex.Unlock()
+	// Update peer state
+	peerState := &PeerState{
+		ID:       msg.PeerID,
+		Status:   "active",
+		LastSeen: time.Now(),
+		Metadata: msg.Metadata,
 	}
+
+	c.node.peerStates[msg.PeerID] = peerState
+	c.node.clusterState.LastUpdate = time.Now()
+
+	c.logger.Debugf("Heartbeat from peer %s", msg.PeerID)
 }
 
 // handleLeaderElection handles leader election messages
 func (c *ClusterProtocol) handleLeaderElection(msg *ClusterMessage) {
-	c.logger.WithField("candidate", msg.PeerID).Info("Leader election in progress")
+	c.node.stateMutex.Lock()
+	defer c.node.stateMutex.Unlock()
 
-	// Simple leader election: lowest peer ID becomes leader
-	candidateID := peer.ID(msg.PeerID)
-	currentLeader := c.GetLeader()
+	// Update cluster state
+	c.node.clusterState.Leader = msg.LeaderID
+	c.node.clusterState.LastUpdate = time.Now()
 
-	if currentLeader == "" || candidateID.String() < currentLeader.String() {
-		c.node.stateMutex.Lock()
-		c.node.clusterState.Leader = candidateID
-		c.node.clusterState.Term++
-		c.node.clusterState.LastUpdate = time.Now()
-		c.node.stateMutex.Unlock()
-
-		c.logger.WithField("new_leader", candidateID.String()).Info("New leader elected")
+	// Update metadata
+	if msg.Metadata != nil {
+		for k, v := range msg.Metadata {
+			c.node.clusterState.Metadata[k] = v
+		}
 	}
+
+	c.logger.Infof("Leader election: new leader is %s", msg.LeaderID)
 }
 
 // handlePeerJoin handles peer join messages
@@ -249,32 +255,48 @@ func (c *ClusterProtocol) handlePeerLeave(msg *ClusterMessage) {
 	}
 }
 
-// startLeaderElection starts a leader election
-func (c *ClusterProtocol) startLeaderElection() {
-	c.logger.Info("Starting leader election")
-
-	// Create leader election message
+// startLeaderElection starts the leader election process
+func (c *ClusterProtocol) startLeaderElection() error {
 	msg := &ClusterMessage{
 		Type:      "leader_election",
-		PeerID:    c.node.host.ID().String(),
-		Timestamp: time.Now().Unix(),
+		PeerID:    c.node.pubsub.GetHostID(),
+		LeaderID:  c.node.pubsub.GetHostID(),
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"candidate": c.node.pubsub.GetHostID().String(),
+			"term":      "1",
+		},
 	}
 
-	// Publish to cluster topic
-	c.publishClusterMessage(msg)
+	return c.publishClusterMessage("leader_election", msg.Metadata)
 }
 
 // publishClusterMessage publishes a cluster message
-func (c *ClusterProtocol) publishClusterMessage(msg *ClusterMessage) {
-	// Serialize message
-	_, err := json.Marshal(msg)
-	if err != nil {
-		c.logger.WithError(err).Error("Failed to marshal cluster message")
-		return
+func (c *ClusterProtocol) publishClusterMessage(msgType string, data map[string]interface{}) error {
+	msg := &ClusterMessage{
+		Type:      msgType,
+		Timestamp: time.Now(),
+		LeaderID:  c.node.clusterState.Leader,
+		Metadata:  make(map[string]interface{}),
 	}
 
-	// In a full implementation, you'd publish to the cluster topic
-	c.logger.WithField("type", msg.Type).Debug("Cluster message published")
+	// Copy metadata
+	for k, v := range c.node.clusterState.Metadata {
+		msg.Metadata[k] = v
+	}
+
+	// Add message-specific data
+	for k, v := range data {
+		msg.Metadata[k] = v
+	}
+
+	// Serialize and publish
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal cluster message: %w", err)
+	}
+
+	return c.node.pubsub.Publish(msgBytes)
 }
 
 // periodicTasks performs periodic cluster tasks
@@ -300,17 +322,20 @@ func (c *ClusterProtocol) periodicTasks() {
 }
 
 // sendHeartbeat sends a heartbeat message
-func (c *ClusterProtocol) sendHeartbeat() {
+func (c *ClusterProtocol) sendHeartbeat() error {
 	msg := &ClusterMessage{
 		Type:      "heartbeat",
-		PeerID:    c.node.host.ID().String(),
-		Timestamp: time.Now().Unix(),
-		Metadata: map[string]string{
-			"node_id": c.node.host.ID().String(),
-		},
+		PeerID:    c.node.pubsub.GetHostID(),
+		LeaderID:  c.node.clusterState.Leader,
+		Timestamp: time.Now(),
+		Metadata:  make(map[string]interface{}),
 	}
 
-	c.publishClusterMessage(msg)
+	// Add metadata
+	msg.Metadata["node_id"] = c.node.pubsub.GetHostID().String()
+	msg.Metadata["status"] = "active"
+
+	return c.publishClusterMessage("heartbeat", msg.Metadata)
 }
 
 // checkLeaderHealth checks the health of the current leader

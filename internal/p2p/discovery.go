@@ -121,13 +121,7 @@ func (d *DiscoveryProtocol) HandlePeerFound(pi peer.AddrInfo) {
 	}).Info("Peer discovered via mDNS")
 
 	// Add peer to discovered peers
-	d.AddPeer(pi.ID, &PeerState{
-		ID:        pi.ID,
-		Addresses: d.addrInfoToStrings(pi.Addrs),
-		Status:    "active",
-		LastSeen:  time.Now(),
-		Metadata:  map[string]string{"discovery": "mdns"},
-	})
+	d.AddPeer(pi)
 
 	// Try to connect to the peer
 	go d.connectToPeer(pi)
@@ -217,20 +211,29 @@ func (d *DiscoveryProtocol) connectToPeer(pi peer.AddrInfo) {
 }
 
 // AddPeer adds a peer to the discovered peers list
-func (d *DiscoveryProtocol) AddPeer(peerID peer.ID, info *PeerState) error {
+func (d *DiscoveryProtocol) AddPeer(pi peer.AddrInfo) {
 	d.peersMutex.Lock()
 	defer d.peersMutex.Unlock()
 
-	d.discoveredPeers[peerID] = info
+	// Convert addresses to multiaddr format
+	addresses := make([]multiaddr.Multiaddr, len(pi.Addrs))
+	for i, addr := range pi.Addrs {
+		addresses[i] = addr
+	}
 
-	// Also add to the main node's peer states
-	d.node.stateMutex.Lock()
-	d.node.peerStates[peerID] = info
-	d.node.clusterState.Peers[peerID] = info
-	d.node.stateMutex.Unlock()
+	// Create peer state
+	peerState := &PeerState{
+		ID:        pi.ID,
+		Addresses: addresses,
+		Status:    "active",
+		LastSeen:  time.Now(),
+		Metadata: map[string]interface{}{
+			"discovered": "true",
+		},
+	}
 
-	d.logger.WithField("peer_id", peerID.String()).Debug("Added peer to discovery")
-	return nil
+	d.discoveredPeers[pi.ID] = peerState
+	d.logger.WithField("peer_id", pi.ID.String()).Debug("Peer added to discovery")
 }
 
 // RemovePeer removes a peer from the discovered peers list

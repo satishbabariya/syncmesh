@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,8 +18,6 @@ import (
 // FileSyncProtocol handles file synchronization across the P2P network
 type FileSyncProtocol struct {
 	node   *P2PNode
-	topic  *MockTopic
-	sub    *MockSubscription
 	logger *logrus.Entry
 
 	// File operations
@@ -51,20 +50,7 @@ func NewFileSyncProtocol(node *P2PNode) *FileSyncProtocol {
 func (f *FileSyncProtocol) Initialize() error {
 	f.logger.Info("Initializing file sync protocol")
 
-	// Create pubsub topic
-	topic, err := f.node.pubsub.Join(f.node.config.PubSub.FileSyncTopic)
-	if err != nil {
-		return fmt.Errorf("failed to join file sync topic: %w", err)
-	}
-	f.topic = topic
-
-	// Subscribe to the topic
-	sub, err := topic.Subscribe()
-	if err != nil {
-		return fmt.Errorf("failed to subscribe to file sync topic: %w", err)
-	}
-	f.sub = sub
-
+	// The pubsub service is already initialized in the P2P node
 	f.logger.Info("File sync protocol initialized successfully")
 	return nil
 }
@@ -82,10 +68,6 @@ func (f *FileSyncProtocol) Start(ctx context.Context) error {
 	f.ctx, f.cancel = context.WithCancel(ctx)
 
 	f.logger.Info("Starting file sync protocol")
-
-	// Start message handler
-	f.wg.Add(1)
-	go f.handleMessages()
 
 	// Start file workers
 	f.startWorkers()
@@ -113,16 +95,6 @@ func (f *FileSyncProtocol) Stop() {
 	// Stop workers
 	f.stopWorkers()
 
-	// Close subscription
-	if f.sub != nil {
-		f.sub.Cancel()
-	}
-
-	// Close topic
-	if f.topic != nil {
-		f.topic.Close()
-	}
-
 	// Wait for all goroutines to finish
 	f.wg.Wait()
 
@@ -138,52 +110,54 @@ func (f *FileSyncProtocol) PublishFileEvent(event FileEvent) error {
 	}).Info("Publishing file event to P2P network")
 
 	// Create file sync message
-	msg := &FileSyncMessage{
-		Type:      event.Operation,
+	fileMsg := FileSyncMessage{
+		Type:      "file_event",
 		FilePath:  event.Path,
 		Checksum:  event.Checksum,
 		Size:      event.Size,
-		Timestamp: event.Timestamp.Unix(),
-		FromPeer:  f.node.host.ID().String(),
+		Timestamp: time.Now().Unix(),
+		FromPeer:  f.node.GetPubSub().GetHostID().String(),
 		Version:   event.Version,
 		Metadata:  event.Metadata,
 	}
 
-	// Add file data for create/modify operations
-	if event.Operation != "delete" {
-		fileData, err := f.readFileData(event.Path)
-		if err != nil {
-			return fmt.Errorf("failed to read file data: %w", err)
-		}
-		msg.FileData = fileData
-	}
-
 	// Serialize message
-	data, err := json.Marshal(msg)
+	data, err := json.Marshal(fileMsg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal file sync message: %w", err)
 	}
 
-	// Publish to topic
-	if err := f.topic.Publish(f.ctx, data); err != nil {
-		return fmt.Errorf("failed to publish file sync message: %w", err)
+	// Publish to P2P network
+	if err := f.node.GetPubSub().Publish(data); err != nil {
+		return fmt.Errorf("failed to publish file event: %w", err)
 	}
+
+	// Update local file state
+	f.updateFileState(event)
 
 	f.logger.WithField("file", event.Path).Info("File event published successfully")
 	return nil
 }
 
-// GetFileState returns the state of a file
-func (f *FileSyncProtocol) GetFileState(path string) (*FileState, error) {
+// GetFileState returns the file state for a given path
+func (f *FileSyncProtocol) GetFileState(path string) *FileState {
 	f.stateMutex.RLock()
 	defer f.stateMutex.RUnlock()
 
 	state, exists := f.fileStates[path]
 	if !exists {
-		return nil, fmt.Errorf("file state not found: %s", path)
+		return nil
 	}
 
-	return state, nil
+	return &FileState{
+		Path:         state.Path,
+		Size:         state.Size,
+		ModTime:      state.ModTime,
+		Checksum:     state.Checksum,
+		LastSync:     state.LastSync,
+		SyncStatus:   state.SyncStatus,
+		ErrorMessage: state.ErrorMessage,
+	}
 }
 
 // UpdateFileState updates the state of a file
@@ -195,76 +169,53 @@ func (f *FileSyncProtocol) UpdateFileState(path string, state *FileState) error 
 	return nil
 }
 
-// handleMessages handles incoming file sync messages
-func (f *FileSyncProtocol) handleMessages() {
-	defer f.wg.Done()
-
-	for {
-		select {
-		case <-f.ctx.Done():
-			return
-		default:
-			msg, err := f.sub.Next(f.ctx)
-			if err != nil {
-				f.logger.WithError(err).Error("Failed to get next message")
-				continue
-			}
-
-			// Skip messages from self
-			if msg.ReceivedFrom == f.node.host.ID().String() {
-				continue
-			}
-
-			go f.processMessage(msg)
-		}
-	}
-}
-
-// processMessage processes a file sync message
-func (f *FileSyncProtocol) processMessage(msg *MockMessage) {
+// processMessage processes a file sync message from pubsub
+func (f *FileSyncProtocol) processMessage(data []byte, fromPeer string) {
 	f.logger.WithFields(logrus.Fields{
-		"from_peer": msg.ReceivedFrom,
-		"data_size": len(msg.Data),
+		"from_peer": fromPeer,
+		"data_size": len(data),
 	}).Debug("Processing file sync message")
 
 	// Parse message
 	var fileMsg FileSyncMessage
-	if err := json.Unmarshal(msg.Data, &fileMsg); err != nil {
+	if err := json.Unmarshal(data, &fileMsg); err != nil {
 		f.logger.WithError(err).Error("Failed to unmarshal file sync message")
 		return
 	}
 
-	// Create file event
-	event := FileEvent{
-		Path:      fileMsg.FilePath,
-		Operation: fileMsg.Type,
-		Timestamp: time.Unix(fileMsg.Timestamp, 0),
-		Size:      fileMsg.Size,
-		Checksum:  fileMsg.Checksum,
-		FromPeer:  peer.ID(fileMsg.FromPeer),
-		Version:   fileMsg.Version,
-		Metadata:  fileMsg.Metadata,
-	}
-
-	// Check for conflicts
-	if f.hasConflict(event) {
-		f.logger.WithField("file", event.Path).Warn("Conflict detected, resolving")
-		if !f.resolveConflict(event) {
-			f.logger.WithField("file", event.Path).Error("Failed to resolve conflict")
-			return
-		}
-	}
-
-	// Apply file operation
-	if err := f.applyFileOperation(event, fileMsg.FileData); err != nil {
-		f.logger.WithError(err).WithField("file", event.Path).Error("Failed to apply file operation")
+	// Skip messages from self
+	if fileMsg.FromPeer == f.node.GetPubSub().GetHostID().String() {
 		return
 	}
 
-	// Update file state
-	f.updateFileState(event)
+	f.logger.WithFields(logrus.Fields{
+		"type":      fileMsg.Type,
+		"from_peer": fileMsg.FromPeer,
+		"file":      fileMsg.FilePath,
+	}).Info("Processing file sync message from peer")
 
-	f.logger.WithField("file", event.Path).Info("File operation applied successfully")
+	// Handle different message types
+	switch fileMsg.Type {
+	case "file_event":
+		// Convert FileSyncMessage to FileEvent
+		event := FileEvent{
+			Path:      fileMsg.FilePath,
+			Operation: fileMsg.Type,
+			Timestamp: time.Unix(fileMsg.Timestamp, 0),
+			Size:      fileMsg.Size,
+			Checksum:  fileMsg.Checksum,
+			FromPeer:  peer.ID(fileMsg.FromPeer),
+			Version:   fileMsg.Version,
+			Metadata:  fileMsg.Metadata,
+		}
+		f.handleFileEvent(event)
+	case "file_request":
+		f.handleFileRequest(fileMsg)
+	case "file_response":
+		f.handleFileResponse(fileMsg)
+	default:
+		f.logger.WithField("type", fileMsg.Type).Warn("Unknown message type")
+	}
 }
 
 // hasConflict checks if there's a conflict with this file event
@@ -279,7 +230,7 @@ func (f *FileSyncProtocol) hasConflict(event FileEvent) bool {
 
 	// Check if file was recently modified (within last 5 seconds)
 	recentModTime := time.Now().Add(-5 * time.Second)
-	if state.LastSyncTime.After(recentModTime) {
+	if state.LastSync.After(recentModTime) {
 		return true
 	}
 
@@ -418,27 +369,19 @@ func (f *FileSyncProtocol) deleteFile(event FileEvent) error {
 	return nil
 }
 
-// updateFileState updates the file state
+// updateFileState updates the local file state
 func (f *FileSyncProtocol) updateFileState(event FileEvent) {
 	f.stateMutex.Lock()
 	defer f.stateMutex.Unlock()
 
-	state, exists := f.fileStates[event.Path]
-	if !exists {
-		state = &FileState{
-			Path: event.Path,
-		}
-		f.fileStates[event.Path] = state
+	f.fileStates[event.Path] = &FileState{
+		Path:       event.Path,
+		Size:       event.Size,
+		ModTime:    event.ModTime,
+		Checksum:   event.Checksum,
+		LastSync:   time.Now(),
+		SyncStatus: "synced",
 	}
-
-	state.Size = event.Size
-	state.Checksum = event.Checksum
-	state.ModTime = event.Timestamp
-	state.Version = event.Version
-	state.LastSyncTime = time.Now()
-	state.SyncStatus = "synced"
-	state.FromPeer = event.FromPeer
-	state.Metadata = event.Metadata
 }
 
 // readFileData reads file data for transmission
@@ -504,4 +447,89 @@ func (f *FileSyncProtocol) processFileOperation(operation FileOperation) {
 	// This is where you'd implement the actual file processing logic
 	// For now, we'll just log it
 	f.logger.WithField("file", operation.Event.Path).Info("File operation processed")
+}
+
+// handleFileEvent handles a file event from another node
+func (f *FileSyncProtocol) handleFileEvent(event FileEvent) {
+	f.logger.WithFields(logrus.Fields{
+		"file":      event.Path,
+		"operation": event.Operation,
+		"from_peer": event.FromPeer,
+	}).Info("Handling file event from peer")
+
+	// Check if we need to sync this file
+	if f.shouldSyncFile(event) {
+		f.logger.WithField("file", event.Path).Info("File needs synchronization")
+
+		// Add to sync queue
+		operation := FileOperation{
+			Event:       event,
+			Priority:    1,
+			RetryCount:  0,
+			LastAttempt: time.Now(),
+		}
+
+		select {
+		case f.fileQueue <- operation:
+			f.logger.WithField("file", event.Path).Debug("File operation queued")
+		default:
+			f.logger.WithField("file", event.Path).Warn("File queue full, dropping operation")
+		}
+	} else {
+		f.logger.WithField("file", event.Path).Debug("File does not need synchronization")
+	}
+}
+
+// shouldSyncFile determines if a file should be synchronized
+func (f *FileSyncProtocol) shouldSyncFile(event FileEvent) bool {
+	// Check if file is in watched paths
+	if !f.isFileInWatchedPaths(event.Path) {
+		return false
+	}
+
+	// Check if file matches include/exclude patterns
+	if !f.matchesFilePatterns(event.Path) {
+		return false
+	}
+
+	// Check if we already have this file with same checksum
+	f.stateMutex.RLock()
+	existingState, exists := f.fileStates[event.Path]
+	f.stateMutex.RUnlock()
+
+	if exists && existingState.Checksum == event.Checksum {
+		return false
+	}
+
+	return true
+}
+
+// isFileInWatchedPaths checks if a file is in the watched paths
+func (f *FileSyncProtocol) isFileInWatchedPaths(filePath string) bool {
+	// For now, assume all files in /app/data should be synced
+	// This can be enhanced with configurable watched paths
+	return strings.HasPrefix(filePath, "/app/data")
+}
+
+// matchesFilePatterns checks if a file matches the include/exclude patterns
+func (f *FileSyncProtocol) matchesFilePatterns(filePath string) bool {
+	// For now, accept all files
+	// This can be enhanced with pattern matching
+	return true
+}
+
+// handleFileRequest handles a file request from another node
+func (f *FileSyncProtocol) handleFileRequest(msg FileSyncMessage) {
+	f.logger.WithField("file", msg.FilePath).Info("Handling file request from peer")
+
+	// TODO: Implement file serving logic
+	// This would involve reading the file and sending it to the requesting peer
+}
+
+// handleFileResponse handles a file response from another node
+func (f *FileSyncProtocol) handleFileResponse(msg FileSyncMessage) {
+	f.logger.WithField("file", msg.FilePath).Info("Handling file response from peer")
+
+	// TODO: Implement file receiving logic
+	// This would involve writing the received file to the local filesystem
 }

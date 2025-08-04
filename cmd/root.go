@@ -49,10 +49,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create and start server
-	srv, err := server.New(cfg)
-	if err != nil {
-		return fmt.Errorf("failed to create server: %w", err)
-	}
+	srv := server.New(cfg)
 
 	return srv.Start(ctx)
 }

@@ -61,6 +61,7 @@ type SyncConfig struct {
 	CompressionLevel   int           `mapstructure:"compression_level" yaml:"compression_level"`
 	ExcludePatterns    []string      `mapstructure:"exclude_patterns" yaml:"exclude_patterns"`
 	IncludePatterns    []string      `mapstructure:"include_patterns" yaml:"include_patterns"`
+	WatchedPaths       []string      `mapstructure:"watched_paths" yaml:"watched_paths"`
 }
 
 type ClusterConfig struct {

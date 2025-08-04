@@ -13,6 +13,7 @@ type FileEvent struct {
 	Timestamp time.Time
 	Size      int64
 	Checksum  string
+	ModTime   time.Time
 	FromPeer  peer.ID
 	Version   uint64
 	Metadata  map[string]string
@@ -53,10 +54,11 @@ type P2PConsensus struct {
 
 // ClusterMessage represents a cluster coordination message
 type ClusterMessage struct {
-	Type      string            `json:"type"`
-	PeerID    string            `json:"peer_id"`
-	Metadata  map[string]string `json:"metadata"`
-	Timestamp int64             `json:"timestamp"`
+	Type      string                 `json:"type"`
+	PeerID    peer.ID                `json:"peer_id"`
+	LeaderID  peer.ID                `json:"leader_id"`
+	Metadata  map[string]interface{} `json:"metadata"`
+	Timestamp time.Time              `json:"timestamp"`
 }
 
 // FileSyncMessage represents a file synchronization message
