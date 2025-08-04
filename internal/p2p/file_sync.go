@@ -455,29 +455,120 @@ func (f *FileSyncProtocol) handleFileEvent(event FileEvent) {
 		"file":      event.Path,
 		"operation": event.Operation,
 		"from_peer": event.FromPeer,
+		"size":      event.Size,
 	}).Info("Handling file event from peer")
 
 	// Check if we need to sync this file
 	if f.shouldSyncFile(event) {
 		f.logger.WithField("file", event.Path).Info("File needs synchronization")
 
-		// Add to sync queue
-		operation := FileOperation{
-			Event:       event,
-			Priority:    1,
-			RetryCount:  0,
-			LastAttempt: time.Now(),
+		// Check for conflicts
+		if f.hasConflict(event) {
+			f.logger.WithField("file", event.Path).Warn("File conflict detected")
+			if !f.resolveConflict(event) {
+				f.logger.WithField("file", event.Path).Info("Conflict resolution rejected the file")
+				return
+			}
 		}
 
-		select {
-		case f.fileQueue <- operation:
-			f.logger.WithField("file", event.Path).Debug("File operation queued")
-		default:
-			f.logger.WithField("file", event.Path).Warn("File queue full, dropping operation")
-		}
+		// Request the file from the peer
+		go f.requestFileFromPeer(event)
 	} else {
 		f.logger.WithField("file", event.Path).Debug("File does not need synchronization")
 	}
+}
+
+// requestFileFromPeer requests a file from a peer
+func (f *FileSyncProtocol) requestFileFromPeer(event FileEvent) {
+	f.logger.WithFields(logrus.Fields{
+		"file":      event.Path,
+		"from_peer": event.FromPeer,
+	}).Info("Requesting file from peer")
+
+	// Create file request message
+	requestMsg := FileSyncMessage{
+		Type:      "file_request",
+		FilePath:  event.Path,
+		Timestamp: time.Now().Unix(),
+		FromPeer:  f.node.GetPubSub().GetHostID().String(),
+	}
+
+	// Serialize and publish request
+	data, err := json.Marshal(requestMsg)
+	if err != nil {
+		f.logger.WithError(err).Error("Failed to marshal file request")
+		return
+	}
+
+	// Publish request to P2P network
+	if err := f.node.GetPubSub().Publish(data); err != nil {
+		f.logger.WithError(err).Error("Failed to publish file request")
+		return
+	}
+
+	f.logger.WithField("file", event.Path).Info("File request published to P2P network")
+}
+
+// handleFileRequest handles a file request from another node
+func (f *FileSyncProtocol) handleFileRequest(msg FileSyncMessage) {
+	f.logger.WithField("file", msg.FilePath).Info("Handling file request from peer")
+
+	// Read the requested file
+	fileData, err := f.readFileData(msg.FilePath)
+	if err != nil {
+		f.logger.WithError(err).WithField("file", msg.FilePath).Error("Failed to read requested file")
+		return
+	}
+
+	// Create file response message
+	responseMsg := FileSyncMessage{
+		Type:      "file_response",
+		FilePath:  msg.FilePath,
+		Timestamp: time.Now().Unix(),
+		FromPeer:  f.node.GetPubSub().GetHostID().String(),
+		Size:      int64(len(fileData)),
+		// Note: In a real implementation, you'd need to handle large files differently
+		// For now, we'll include the file data in the message (suitable for small files)
+		FileData: fileData,
+	}
+
+	// Serialize and publish response
+	data, err := json.Marshal(responseMsg)
+	if err != nil {
+		f.logger.WithError(err).Error("Failed to marshal file response")
+		return
+	}
+
+	// Publish response to P2P network
+	if err := f.node.GetPubSub().Publish(data); err != nil {
+		f.logger.WithError(err).Error("Failed to publish file response")
+		return
+	}
+
+	f.logger.WithField("file", msg.FilePath).Info("File response published to P2P network")
+}
+
+// handleFileResponse handles a file response from another node
+func (f *FileSyncProtocol) handleFileResponse(msg FileSyncMessage) {
+	f.logger.WithFields(logrus.Fields{
+		"file":      msg.FilePath,
+		"from_peer": msg.FromPeer,
+		"size":      msg.Size,
+	}).Info("Handling file response from peer")
+
+	// Create the file locally
+	if err := f.createOrModifyFile(FileEvent{
+		Path:      msg.FilePath,
+		Operation: "create",
+		Timestamp: time.Unix(msg.Timestamp, 0),
+		Size:      msg.Size,
+		FromPeer:  peer.ID(msg.FromPeer),
+	}, msg.FileData); err != nil {
+		f.logger.WithError(err).WithField("file", msg.FilePath).Error("Failed to create file from peer response")
+		return
+	}
+
+	f.logger.WithField("file", msg.FilePath).Info("Successfully synced file from peer")
 }
 
 // shouldSyncFile determines if a file should be synchronized
@@ -506,9 +597,18 @@ func (f *FileSyncProtocol) shouldSyncFile(event FileEvent) bool {
 
 // isFileInWatchedPaths checks if a file is in the watched paths
 func (f *FileSyncProtocol) isFileInWatchedPaths(filePath string) bool {
-	// For now, assume all files in /app/data should be synced
-	// This can be enhanced with configurable watched paths
-	return strings.HasPrefix(filePath, "/app/data")
+	// Check if file is in any of the watched paths
+	watchedPaths := []string{
+		"/app/data",
+		"/opt/tomcat/webapps/zenoptics/resources",
+	}
+
+	for _, watchedPath := range watchedPaths {
+		if strings.HasPrefix(filePath, watchedPath) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchesFilePatterns checks if a file matches the include/exclude patterns
@@ -516,20 +616,4 @@ func (f *FileSyncProtocol) matchesFilePatterns(filePath string) bool {
 	// For now, accept all files
 	// This can be enhanced with pattern matching
 	return true
-}
-
-// handleFileRequest handles a file request from another node
-func (f *FileSyncProtocol) handleFileRequest(msg FileSyncMessage) {
-	f.logger.WithField("file", msg.FilePath).Info("Handling file request from peer")
-
-	// TODO: Implement file serving logic
-	// This would involve reading the file and sending it to the requesting peer
-}
-
-// handleFileResponse handles a file response from another node
-func (f *FileSyncProtocol) handleFileResponse(msg FileSyncMessage) {
-	f.logger.WithField("file", msg.FilePath).Info("Handling file response from peer")
-
-	// TODO: Implement file receiving logic
-	// This would involve writing the received file to the local filesystem
 }

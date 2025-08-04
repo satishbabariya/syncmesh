@@ -72,6 +72,8 @@ func (r *RealPubSubService) Start(p2pConfig *config.P2PConfig) error {
 	}
 	r.host = host
 
+	r.logger.WithField("host_id", host.ID().String()).Info("Created libp2p host")
+
 	// Create pubsub service
 	ps, err := pubsub.NewGossipSub(r.ctx, r.host)
 	if err != nil {
@@ -93,6 +95,8 @@ func (r *RealPubSubService) Start(p2pConfig *config.P2PConfig) error {
 	}
 	r.sub = sub
 
+	r.logger.Info("Joined syncmesh-files topic and subscribed")
+
 	// Start discovery service
 	r.startDiscovery()
 
@@ -100,12 +104,16 @@ func (r *RealPubSubService) Start(p2pConfig *config.P2PConfig) error {
 	r.wg.Add(1)
 	go r.handleMessages()
 
-	// Start peer connection monitoring
+	// Start peer monitoring
 	r.wg.Add(1)
 	go r.monitorPeers()
 
+	// Start peer connection attempts
+	r.wg.Add(1)
+	go r.attemptPeerConnections()
+
 	r.running = true
-	r.logger.Info("Real pubsub service started successfully")
+	r.logger.Info("PubSub service started successfully")
 	return nil
 }
 
@@ -155,23 +163,85 @@ func (r *RealPubSubService) startDiscovery() {
 func (r *RealPubSubService) HandlePeerFound(pi peer.AddrInfo) {
 	// Don't connect to self
 	if pi.ID == r.host.ID() {
+		r.logger.Debug("Ignoring self in peer discovery")
 		return
 	}
 
-	r.logger.WithField("peer", pi.ID.String()).Info("Peer discovered")
+	r.logger.WithField("peer", pi.ID.String()).Info("Peer discovered via mDNS")
 
-	// Connect to the peer
-	if err := r.host.Connect(r.ctx, pi); err != nil {
-		r.logger.WithError(err).WithField("peer", pi.ID.String()).Error("Failed to connect to peer")
+	// Check if already connected
+	r.peersMu.RLock()
+	_, exists := r.peers[pi.ID]
+	r.peersMu.RUnlock()
+
+	if exists {
+		r.logger.WithField("peer", pi.ID.String()).Debug("Already connected to peer")
 		return
 	}
 
-	// Add to peers list
-	r.peersMu.Lock()
-	r.peers[pi.ID] = pi
-	r.peersMu.Unlock()
+	// Connect to the peer with retry logic
+	go r.connectToPeer(pi)
+}
 
-	r.logger.WithField("peer", pi.ID.String()).Info("Connected to peer")
+// connectToPeer attempts to connect to a peer with retry logic
+func (r *RealPubSubService) connectToPeer(pi peer.AddrInfo) {
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		r.logger.WithFields(logrus.Fields{
+			"peer":    pi.ID.String(),
+			"attempt": attempt,
+		}).Info("Attempting to connect to peer")
+
+		// Connect to the peer
+		if err := r.host.Connect(r.ctx, pi); err != nil {
+			r.logger.WithError(err).WithFields(logrus.Fields{
+				"peer":    pi.ID.String(),
+				"attempt": attempt,
+			}).Warn("Failed to connect to peer")
+
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+			return
+		}
+
+		// Add to peers list
+		r.peersMu.Lock()
+		r.peers[pi.ID] = pi
+		r.peersMu.Unlock()
+
+		r.logger.WithField("peer", pi.ID.String()).Info("Successfully connected to peer")
+		return
+	}
+
+	r.logger.WithField("peer", pi.ID.String()).Error("Failed to connect to peer after all attempts")
+}
+
+// attemptPeerConnections periodically attempts to connect to known peers
+func (r *RealPubSubService) attemptPeerConnections() {
+	defer r.wg.Done()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-ticker.C:
+			// Get current peer count
+			r.peersMu.RLock()
+			peerCount := len(r.peers)
+			r.peersMu.RUnlock()
+
+			r.logger.WithField("peer_count", peerCount).Info("Current peer count")
+
+			// If no peers, try to discover more
+			if peerCount == 0 {
+				r.logger.Info("No peers connected, continuing discovery...")
+			}
+		}
+	}
 }
 
 // monitorPeers monitors peer connections
