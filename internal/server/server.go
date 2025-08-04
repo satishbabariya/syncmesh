@@ -8,12 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/satishbabariya/syncmesh/internal/cluster"
 	"github.com/satishbabariya/syncmesh/internal/config"
 	"github.com/satishbabariya/syncmesh/internal/docker"
 	"github.com/satishbabariya/syncmesh/internal/logger"
 	"github.com/satishbabariya/syncmesh/internal/monitoring"
-	syncengine "github.com/satishbabariya/syncmesh/internal/sync"
+	"github.com/satishbabariya/syncmesh/internal/p2p"
 	"github.com/satishbabariya/syncmesh/pkg/api"
 	"github.com/satishbabariya/syncmesh/pkg/grpc"
 	"github.com/sirupsen/logrus"
@@ -25,10 +24,9 @@ type Server struct {
 	logger *logrus.Entry
 
 	// Core components
-	syncEngine     *syncengine.Engine
-	clusterManager *cluster.Manager
-	dockerClient   *docker.Client
-	monitoring     *monitoring.Service
+	p2pNode      *p2p.P2PNode
+	dockerClient *docker.Client
+	monitoring   *monitoring.Service
 
 	// Network components
 	httpServer *http.Server
@@ -69,7 +67,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.running = true
 	s.mu.Unlock()
 
-	s.logger.Info("Starting gluster-cluster server")
+	s.logger.Info("Starting SyncMesh P2P server")
 
 	// Start components in order
 	if err := s.startComponents(ctx); err != nil {
@@ -85,6 +83,7 @@ func (s *Server) Start(ctx context.Context) error {
 		"node_id":   s.config.NodeID,
 		"http_port": s.config.Server.Port,
 		"grpc_port": s.config.Server.GRPCPort,
+		"p2p_port":  s.config.P2P.Port,
 	}).Info("Server started successfully")
 
 	// Wait for shutdown signal
@@ -136,22 +135,16 @@ func (s *Server) initializeComponents() error {
 		return fmt.Errorf("failed to create Docker client: %w", err)
 	}
 
-	// Initialize cluster manager
-	s.clusterManager, err = cluster.NewManager(&s.config.Cluster, s.config.NodeID)
-	if err != nil {
-		return fmt.Errorf("failed to create cluster manager: %w", err)
-	}
-
-	// Initialize sync engine
-	s.syncEngine, err = syncengine.NewEngine(&s.config.Sync, s.dockerClient, s.clusterManager)
-	if err != nil {
-		return fmt.Errorf("failed to create sync engine: %w", err)
-	}
-
 	// Initialize monitoring service
 	s.monitoring, err = monitoring.NewService(&s.config.Monitoring)
 	if err != nil {
 		return fmt.Errorf("failed to create monitoring service: %w", err)
+	}
+
+	// Initialize P2P node
+	s.p2pNode, err = p2p.NewP2PNode(&s.config.P2P, s.dockerClient)
+	if err != nil {
+		return fmt.Errorf("failed to create P2P node: %w", err)
 	}
 
 	return nil
@@ -159,14 +152,9 @@ func (s *Server) initializeComponents() error {
 
 // startComponents starts all server components
 func (s *Server) startComponents(ctx context.Context) error {
-	// Start cluster manager
-	if err := s.clusterManager.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start cluster manager: %w", err)
-	}
-
-	// Start sync engine
-	if err := s.syncEngine.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start sync engine: %w", err)
+	// Start P2P node
+	if err := s.p2pNode.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start P2P node: %w", err)
 	}
 
 	// Start monitoring service
@@ -180,7 +168,7 @@ func (s *Server) startComponents(ctx context.Context) error {
 // startNetworkServices starts HTTP and gRPC servers
 func (s *Server) startNetworkServices() error {
 	// Start HTTP server
-	httpMux := api.NewHTTPHandler(s.syncEngine, s.clusterManager, s.monitoring)
+	httpMux := api.NewHTTPHandler(s.p2pNode, s.monitoring)
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port),
 		Handler:      httpMux,
@@ -189,34 +177,32 @@ func (s *Server) startNetworkServices() error {
 		IdleTimeout:  s.config.Server.IdleTimeout,
 	}
 
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.logger.WithField("addr", s.httpServer.Addr).Info("Starting HTTP server")
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			s.logger.WithError(err).Error("HTTP server failed")
-		}
-	}()
-
 	// Start gRPC server
 	var err error
-	s.grpcServer, err = grpc.NewServer(s.config, s.syncEngine, s.clusterManager)
+	s.grpcServer, err = grpc.NewServer(s.config, s.p2pNode, s.monitoring)
 	if err != nil {
 		return fmt.Errorf("failed to create gRPC server: %w", err)
 	}
 
-	grpcAddr := fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.GRPCPort)
-	lis, err := net.Listen("tcp", grpcAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on gRPC port: %w", err)
-	}
-
-	s.wg.Add(1)
+	// Start HTTP server
 	go func() {
-		defer s.wg.Done()
-		s.logger.WithField("addr", grpcAddr).Info("Starting gRPC server")
+		s.logger.WithField("address", s.httpServer.Addr).Info("Starting HTTP server")
+		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			s.logger.WithError(err).Error("HTTP server error")
+		}
+	}()
+
+	// Start gRPC server
+	go func() {
+		lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.GRPCPort))
+		if err != nil {
+			s.logger.WithError(err).Error("Failed to create gRPC listener")
+			return
+		}
+
+		s.logger.WithField("address", lis.Addr().String()).Info("Starting gRPC server")
 		if err := s.grpcServer.Serve(lis); err != nil {
-			s.logger.WithError(err).Error("gRPC server failed")
+			s.logger.WithError(err).Error("gRPC server error")
 		}
 	}()
 
@@ -246,12 +232,8 @@ func (s *Server) stopComponents() {
 		s.monitoring.Stop()
 	}
 
-	if s.syncEngine != nil {
-		s.syncEngine.Stop()
-	}
-
-	if s.clusterManager != nil {
-		s.clusterManager.Stop()
+	if s.p2pNode != nil {
+		s.p2pNode.Stop()
 	}
 
 	if s.dockerClient != nil {
@@ -259,29 +241,22 @@ func (s *Server) stopComponents() {
 	}
 }
 
-// Health returns the health status of the server
+// Health returns the health status of all components
 func (s *Server) Health() map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	health := map[string]interface{}{
 		"status":    "healthy",
-		"node_id":   s.config.NodeID,
-		"running":   s.running,
 		"timestamp": time.Now().UTC(),
 	}
 
 	// Add component health status
-	if s.clusterManager != nil {
-		health["cluster"] = s.clusterManager.Health()
+	if s.p2pNode != nil {
+		health["p2p"] = s.p2pNode.Health()
 	}
 
-	if s.syncEngine != nil {
-		health["sync"] = s.syncEngine.Health()
-	}
-
-	if s.dockerClient != nil {
-		health["docker"] = s.dockerClient.Health()
+	if s.monitoring != nil {
+		health["monitoring"] = map[string]interface{}{
+			"running": s.monitoring != nil,
+		}
 	}
 
 	return health

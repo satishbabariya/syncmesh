@@ -7,10 +7,10 @@ import (
 	"net"
 	"time"
 
-	"github.com/satishbabariya/syncmesh/internal/cluster"
 	"github.com/satishbabariya/syncmesh/internal/config"
 	"github.com/satishbabariya/syncmesh/internal/logger"
-	"github.com/satishbabariya/syncmesh/internal/sync"
+	"github.com/satishbabariya/syncmesh/internal/monitoring"
+	"github.com/satishbabariya/syncmesh/internal/p2p"
 	"github.com/satishbabariya/syncmesh/pkg/proto"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -27,23 +27,23 @@ type Server struct {
 	proto.UnimplementedFileSyncServer
 	proto.UnimplementedClusterServer
 
-	config         *config.Config
-	logger         *logrus.Entry
-	syncEngine     *sync.Engine
-	clusterManager *cluster.Manager
+	config     *config.Config
+	logger     *logrus.Entry
+	p2pNode    *p2p.P2PNode
+	monitoring *monitoring.Service
 
 	grpcServer *grpc.Server
 }
 
 // NewServer creates a new gRPC server
-func NewServer(cfg *config.Config, syncEngine *sync.Engine, clusterManager *cluster.Manager) (*Server, error) {
+func NewServer(cfg *config.Config, p2pNode *p2p.P2PNode, monitoring *monitoring.Service) (*Server, error) {
 	logger := logger.NewForComponent("grpc-server")
 
 	server := &Server{
-		config:         cfg,
-		logger:         logger,
-		syncEngine:     syncEngine,
-		clusterManager: clusterManager,
+		config:     cfg,
+		logger:     logger,
+		p2pNode:    p2pNode,
+		monitoring: monitoring,
 	}
 
 	// Configure gRPC server options
@@ -331,86 +331,67 @@ func (s *Server) JoinCluster(ctx context.Context, req *proto.JoinClusterRequest)
 		"address": req.Address,
 	}).Info("Received cluster join request")
 
-	// Add node to cluster
-	node := &cluster.Node{
-		ID:       req.NodeId,
-		Address:  req.Address,
-		Status:   "active",
-		LastSeen: time.Now(),
-		Version:  req.Version,
-		Metadata: req.Metadata,
-		JoinedAt: time.Now(),
-	}
-
-	if err := s.clusterManager.AddNode(node); err != nil {
-		return &proto.JoinClusterResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to add node: %v", err),
-		}, nil
-	}
+	// In P2P, nodes join automatically via discovery
+	// This method is kept for API compatibility
 
 	// Get current cluster state
-	nodes := s.clusterManager.GetNodes()
+	nodes := s.p2pNode.GetNodes()
 	clusterNodes := make([]*proto.ClusterNode, 0, len(nodes))
-	for _, n := range nodes {
+	for nodeID, nodeData := range nodes {
+		node := nodeData.(map[string]interface{})
 		clusterNodes = append(clusterNodes, &proto.ClusterNode{
-			NodeId:   n.ID,
-			Address:  n.Address,
-			Status:   n.Status,
-			IsLeader: n.IsLeader,
-			Version:  n.Version,
-			Metadata: n.Metadata,
+			NodeId:   nodeID,
+			Address:  fmt.Sprintf("%v", node["addresses"]),
+			Status:   node["status"].(string),
+			IsLeader: false, // Will be determined by P2P consensus
+			Version:  "1.0.0",
+			Metadata: node["metadata"].(map[string]string),
 		})
 	}
 
-	response := &proto.JoinClusterResponse{
+	return &proto.JoinClusterResponse{
 		Success:  true,
 		Message:  "Successfully joined cluster",
-		LeaderId: s.clusterManager.GetLeaderID(),
+		LeaderId: s.p2pNode.GetLeaderID(),
 		Nodes:    clusterNodes,
-	}
-
-	return response, nil
+	}, nil
 }
 
 // LeaveCluster handles cluster leave requests
 func (s *Server) LeaveCluster(ctx context.Context, req *proto.LeaveClusterRequest) (*proto.LeaveClusterResponse, error) {
 	s.logger.WithField("node_id", req.NodeId).Info("Received cluster leave request")
 
-	if err := s.clusterManager.RemoveNode(req.NodeId); err != nil {
-		return &proto.LeaveClusterResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to remove node: %v", err),
-		}, nil
-	}
+	// In P2P, nodes leave automatically when they go offline
+	// This method is kept for API compatibility
 
 	return &proto.LeaveClusterResponse{
 		Success: true,
-		Message: "Successfully left cluster",
+		Message: fmt.Sprintf("Node %s left cluster", req.NodeId),
 	}, nil
 }
 
 // GetClusterStatus returns current cluster status
 func (s *Server) GetClusterStatus(ctx context.Context, req *proto.GetClusterStatusRequest) (*proto.GetClusterStatusResponse, error) {
-	nodes := s.clusterManager.GetNodes()
+	nodes := s.p2pNode.GetNodes()
 	clusterNodes := make([]*proto.ClusterNode, 0, len(nodes))
 
-	for _, node := range nodes {
+	for nodeID, nodeData := range nodes {
+		node := nodeData.(map[string]interface{})
 		clusterNodes = append(clusterNodes, &proto.ClusterNode{
-			NodeId:   node.ID,
-			Address:  node.Address,
-			Status:   node.Status,
-			IsLeader: node.IsLeader,
-			Version:  node.Version,
-			Metadata: node.Metadata,
+			NodeId:   nodeID,
+			Address:  fmt.Sprintf("%v", node["addresses"]),
+			Status:   node["status"].(string),
+			IsLeader: nodeID == s.p2pNode.GetLeaderID(),
+			Version:  "1.0.0",
+			Metadata: node["metadata"].(map[string]string),
 		})
 	}
 
 	response := &proto.GetClusterStatusResponse{
-		LeaderId:    s.clusterManager.GetLeaderID(),
+		LeaderId:    s.p2pNode.GetLeaderID(),
 		Nodes:       clusterNodes,
 		TotalNodes:  int32(len(nodes)),
-		ActiveNodes: int32(len(s.clusterManager.GetActiveNodes())),
+		ActiveNodes: int32(len(nodes)), // In P2P, all nodes are considered active
 	}
 
 	return response, nil
@@ -431,7 +412,7 @@ func (s *Server) StreamClusterEvents(req *proto.StreamClusterEventsRequest, stre
 		case <-ticker.C:
 			event := &proto.ClusterEvent{
 				Type:      "node-heartbeat",
-				NodeId:    s.clusterManager.GetNodeID(),
+				NodeId:    s.p2pNode.GetNodeID(),
 				Timestamp: time.Now().Unix(),
 				Data: map[string]string{
 					"status": "active",

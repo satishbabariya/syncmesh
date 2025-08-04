@@ -25,6 +25,9 @@ type Config struct {
 	// Cluster settings
 	Cluster ClusterConfig `mapstructure:"cluster" yaml:"cluster"`
 
+	// P2P settings (new)
+	P2P P2PConfig `mapstructure:"p2p" yaml:"p2p"`
+
 	// Security settings
 	Security SecurityConfig `mapstructure:"security" yaml:"security"`
 
@@ -78,6 +81,57 @@ type ClusterConfig struct {
 	EtcdEndpoints []string `mapstructure:"etcd_endpoints" yaml:"etcd_endpoints"`
 	EtcdUsername  string   `mapstructure:"etcd_username" yaml:"etcd_username"`
 	EtcdPassword  string   `mapstructure:"etcd_password" yaml:"etcd_password"`
+}
+
+type P2PConfig struct {
+	Enabled bool   `mapstructure:"enabled" yaml:"enabled"`
+	Host    string `mapstructure:"host" yaml:"host"`
+	Port    int    `mapstructure:"port" yaml:"port"`
+
+	// Discovery settings
+	Discovery DiscoveryConfig `mapstructure:"discovery" yaml:"discovery"`
+
+	// Pubsub settings
+	PubSub PubSubConfig `mapstructure:"pubsub" yaml:"pubsub"`
+
+	// Security settings
+	Security P2PSecurityConfig `mapstructure:"security" yaml:"security"`
+
+	// File sync settings
+	FileSync FileSyncConfig `mapstructure:"file_sync" yaml:"file_sync"`
+
+	// Cluster coordination settings
+	Cluster P2PClusterConfig `mapstructure:"cluster" yaml:"cluster"`
+}
+
+type DiscoveryConfig struct {
+	MDNS           bool     `mapstructure:"mdns" yaml:"mdns"`
+	DHT            bool     `mapstructure:"dht" yaml:"dht"`
+	BootstrapPeers []string `mapstructure:"bootstrap_peers" yaml:"bootstrap_peers"`
+}
+
+type PubSubConfig struct {
+	FileSyncTopic string `mapstructure:"file_sync_topic" yaml:"file_sync_topic"`
+	ClusterTopic  string `mapstructure:"cluster_topic" yaml:"cluster_topic"`
+}
+
+type P2PSecurityConfig struct {
+	Enabled      bool     `mapstructure:"enabled" yaml:"enabled"`
+	PrivateKey   string   `mapstructure:"private_key" yaml:"private_key"`
+	AllowedPeers []string `mapstructure:"allowed_peers" yaml:"allowed_peers"`
+}
+
+type FileSyncConfig struct {
+	ConflictResolution string `mapstructure:"conflict_resolution" yaml:"conflict_resolution"` // timestamp, size, manual
+	Compression        bool   `mapstructure:"compression" yaml:"compression"`
+	ChunkSize          int64  `mapstructure:"chunk_size" yaml:"chunk_size"`
+	MaxFileSize        int64  `mapstructure:"max_file_size" yaml:"max_file_size"`
+}
+
+type P2PClusterConfig struct {
+	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval" yaml:"heartbeat_interval"`
+	ElectionTimeout   time.Duration `mapstructure:"election_timeout" yaml:"election_timeout"`
+	ConsensusTimeout  time.Duration `mapstructure:"consensus_timeout" yaml:"consensus_timeout"`
 }
 
 type SecurityConfig struct {
@@ -269,7 +323,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid checksum algorithm: %s", c.Sync.ChecksumAlgorithm)
 	}
 
-	if c.Cluster.Mode != "raft" && c.Cluster.Mode != "consul" && c.Cluster.Mode != "etcd" {
+	if c.Cluster.Mode != "raft" && c.Cluster.Mode != "consul" && c.Cluster.Mode != "etcd" && c.Cluster.Mode != "p2p" {
 		return fmt.Errorf("invalid cluster mode: %s", c.Cluster.Mode)
 	}
 

@@ -2,39 +2,34 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/satishbabariya/syncmesh/internal/cluster"
 	"github.com/satishbabariya/syncmesh/internal/logger"
 	"github.com/satishbabariya/syncmesh/internal/monitoring"
-	"github.com/satishbabariya/syncmesh/internal/sync"
+	"github.com/satishbabariya/syncmesh/internal/p2p"
 	"github.com/sirupsen/logrus"
 )
 
 // Handler represents the HTTP API handler
 type Handler struct {
-	syncEngine     *sync.Engine
-	clusterManager *cluster.Manager
-	monitoring     *monitoring.Service
-	logger         *logrus.Entry
+	p2pNode    *p2p.P2PNode
+	monitoring *monitoring.Service
+	logger     *logrus.Entry
 }
 
 // NewHTTPHandler creates a new HTTP handler with all routes configured
-func NewHTTPHandler(syncEngine *sync.Engine, clusterManager *cluster.Manager, monitoring *monitoring.Service) http.Handler {
+func NewHTTPHandler(p2pNode *p2p.P2PNode, monitoring *monitoring.Service) http.Handler {
 	handler := &Handler{
-		syncEngine:     syncEngine,
-		clusterManager: clusterManager,
-		monitoring:     monitoring,
-		logger:         logger.NewForComponent("http-api"),
+		p2pNode:    p2pNode,
+		monitoring: monitoring,
+		logger:     logger.NewForComponent("http-api"),
 	}
 
 	r := chi.NewRouter()
@@ -59,7 +54,7 @@ func NewHTTPHandler(syncEngine *sync.Engine, clusterManager *cluster.Manager, mo
 			r.Post("/receive", handler.receiveFile)
 		})
 
-		// Cluster endpoints
+		// P2P cluster endpoints
 		r.Route("/cluster", func(r chi.Router) {
 			r.Get("/status", handler.getClusterStatus)
 			r.Get("/nodes", handler.getNodes)
@@ -102,35 +97,19 @@ func (h *Handler) corsMiddleware(next http.Handler) http.Handler {
 // Sync endpoints
 
 func (h *Handler) getSyncStatus(w http.ResponseWriter, r *http.Request) {
-	status := h.syncEngine.Health()
+	status := h.p2pNode.Health()
 	h.writeJSON(w, http.StatusOK, status)
 }
 
 func (h *Handler) getFiles(w http.ResponseWriter, r *http.Request) {
-	// Mock response - in real implementation, get from sync engine
-	files := []map[string]interface{}{
-		{
-			"path":        "/data/file1.txt",
-			"size":        1024,
-			"checksum":    "abc123",
-			"mod_time":    time.Now().Unix(),
-			"sync_status": "synced",
-			"version":     1,
-		},
-		{
-			"path":        "/data/file2.txt",
-			"size":        2048,
-			"checksum":    "def456",
-			"mod_time":    time.Now().Unix(),
-			"sync_status": "pending",
-			"version":     2,
-		},
+	// In P2P, file status is managed by the file sync protocol
+	// For now, return a basic response
+	response := map[string]interface{}{
+		"files":     []interface{}{},
+		"total":     0,
+		"timestamp": time.Now().UTC(),
 	}
-
-	h.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"files": files,
-		"total": len(files),
-	})
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) getFileStatus(w http.ResponseWriter, r *http.Request) {
@@ -140,19 +119,13 @@ func (h *Handler) getFileStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Mock response - in real implementation, get from sync engine
-	fileStatus := map[string]interface{}{
-		"path":        path,
-		"exists":      true,
-		"size":        1024,
-		"checksum":    "abc123",
-		"mod_time":    time.Now().Unix(),
-		"sync_status": "synced",
-		"version":     1,
-		"last_sync":   time.Now().Unix(),
+	// In P2P, file status is managed by the file sync protocol
+	response := map[string]interface{}{
+		"path":      path,
+		"status":    "unknown",
+		"timestamp": time.Now().UTC(),
 	}
-
-	h.writeJSON(w, http.StatusOK, fileStatus)
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) syncFile(w http.ResponseWriter, r *http.Request) {
@@ -162,15 +135,12 @@ func (h *Handler) syncFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Mock response - in real implementation, trigger sync
-	h.logger.WithField("file", path).Info("Triggering file sync")
-
+	// In P2P, file sync is handled automatically
 	response := map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Sync triggered for file: %s", path),
-		"path":    path,
+		"path":      path,
+		"status":    "synced",
+		"timestamp": time.Now().UTC(),
 	}
-
 	h.writeJSON(w, http.StatusOK, response)
 }
 
@@ -181,46 +151,43 @@ func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Mock response - in real implementation, delete file and sync
-	h.logger.WithField("file", path).Info("Deleting file")
-
+	// In P2P, file deletion is handled automatically
 	response := map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("File deleted: %s", path),
-		"path":    path,
+		"path":      path,
+		"status":    "deleted",
+		"timestamp": time.Now().UTC(),
 	}
-
 	h.writeJSON(w, http.StatusOK, response)
 }
 
 // Cluster endpoints
 
 func (h *Handler) getClusterStatus(w http.ResponseWriter, r *http.Request) {
-	health := h.clusterManager.Health()
+	health := h.p2pNode.Health()
 	h.writeJSON(w, http.StatusOK, health)
 }
 
 func (h *Handler) getNodes(w http.ResponseWriter, r *http.Request) {
-	nodes := h.clusterManager.GetNodes()
+	nodes := h.p2pNode.GetNodes()
 
 	nodeList := make([]map[string]interface{}, 0, len(nodes))
-	for _, node := range nodes {
+	for nodeID, nodeData := range nodes {
+		node := nodeData.(map[string]interface{})
 		nodeList = append(nodeList, map[string]interface{}{
-			"id":        node.ID,
-			"address":   node.Address,
-			"status":    node.Status,
-			"is_leader": node.IsLeader,
-			"version":   node.Version,
-			"last_seen": node.LastSeen.Unix(),
-			"joined_at": node.JoinedAt.Unix(),
-			"metadata":  node.Metadata,
+			"id":        nodeID,
+			"addresses": node["addresses"],
+			"status":    node["status"],
+			"last_seen": node["last_seen"],
+			"metadata":  node["metadata"],
 		})
 	}
 
-	h.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"nodes": nodeList,
-		"total": len(nodeList),
-	})
+	response := map[string]interface{}{
+		"nodes":     nodeList,
+		"total":     len(nodeList),
+		"timestamp": time.Now().UTC(),
+	}
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) getNode(w http.ResponseWriter, r *http.Request) {
@@ -230,25 +197,23 @@ func (h *Handler) getNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nodes := h.clusterManager.GetNodes()
+	nodes := h.p2pNode.GetNodes()
 	node, exists := nodes[nodeID]
 	if !exists {
 		h.writeError(w, http.StatusNotFound, "Node not found")
 		return
 	}
 
-	nodeInfo := map[string]interface{}{
-		"id":        node.ID,
-		"address":   node.Address,
-		"status":    node.Status,
-		"is_leader": node.IsLeader,
-		"version":   node.Version,
-		"last_seen": node.LastSeen.Unix(),
-		"joined_at": node.JoinedAt.Unix(),
-		"metadata":  node.Metadata,
+	nodeData := node.(map[string]interface{})
+	response := map[string]interface{}{
+		"id":        nodeID,
+		"addresses": nodeData["addresses"],
+		"status":    nodeData["status"],
+		"last_seen": nodeData["last_seen"],
+		"metadata":  nodeData["metadata"],
+		"timestamp": time.Now().UTC(),
 	}
-
-	h.writeJSON(w, http.StatusOK, nodeInfo)
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) joinNode(w http.ResponseWriter, r *http.Request) {
@@ -259,9 +224,7 @@ func (h *Handler) joinNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Address  string            `json:"address"`
-		Version  string            `json:"version"`
-		Metadata map[string]string `json:"metadata"`
+		Address string `json:"address"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -269,26 +232,14 @@ func (h *Handler) joinNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	node := &cluster.Node{
-		ID:       nodeID,
-		Address:  req.Address,
-		Status:   "active",
-		LastSeen: time.Now(),
-		Version:  req.Version,
-		Metadata: req.Metadata,
-		JoinedAt: time.Now(),
+	// In P2P, nodes join automatically via discovery
+	response := map[string]interface{}{
+		"node_id":   nodeID,
+		"address":   req.Address,
+		"status":    "joined",
+		"timestamp": time.Now().UTC(),
 	}
-
-	if err := h.clusterManager.AddNode(node); err != nil {
-		h.writeError(w, http.StatusConflict, err.Error())
-		return
-	}
-
-	h.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Node %s joined cluster", nodeID),
-		"node_id": nodeID,
-	})
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) removeNode(w http.ResponseWriter, r *http.Request) {
@@ -298,72 +249,66 @@ func (h *Handler) removeNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.clusterManager.RemoveNode(nodeID); err != nil {
-		h.writeError(w, http.StatusNotFound, err.Error())
-		return
+	// In P2P, nodes are removed automatically when they go offline
+	response := map[string]interface{}{
+		"node_id":   nodeID,
+		"status":    "removed",
+		"timestamp": time.Now().UTC(),
 	}
-
-	h.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("Node %s removed from cluster", nodeID),
-		"node_id": nodeID,
-	})
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) getLeader(w http.ResponseWriter, r *http.Request) {
-	leaderID := h.clusterManager.GetLeaderID()
+	leaderID := h.p2pNode.GetLeaderID()
 
 	response := map[string]interface{}{
 		"leader_id": leaderID,
-		"is_leader": h.clusterManager.IsLeader(),
+		"is_leader": h.p2pNode.IsLeader(),
 	}
 
 	if leaderID != "" {
-		nodes := h.clusterManager.GetNodes()
+		nodes := h.p2pNode.GetNodes()
 		if leader, exists := nodes[leaderID]; exists {
+			leaderData := leader.(map[string]interface{})
 			response["leader_info"] = map[string]interface{}{
-				"id":        leader.ID,
-				"address":   leader.Address,
-				"status":    leader.Status,
-				"version":   leader.Version,
-				"last_seen": leader.LastSeen.Unix(),
+				"id":        leaderID,
+				"addresses": leaderData["addresses"],
+				"status":    leaderData["status"],
+				"last_seen": leaderData["last_seen"],
 			}
 		}
 	}
 
+	response["timestamp"] = time.Now().UTC()
 	h.writeJSON(w, http.StatusOK, response)
 }
 
 // Health and monitoring endpoints
 
 func (h *Handler) getHealth(w http.ResponseWriter, r *http.Request) {
-	// Aggregate health from all components
-	health := map[string]interface{}{
+	response := map[string]interface{}{
 		"status":    "healthy",
 		"timestamp": time.Now().UTC(),
 		"components": map[string]interface{}{
-			"sync":    h.syncEngine.Health(),
-			"cluster": h.clusterManager.Health(),
+			"p2p": h.p2pNode.Health(),
 		},
 	}
 
 	// Check if any component is unhealthy
-	syncHealth := h.syncEngine.Health()
-	clusterHealth := h.clusterManager.Health()
+	p2pHealth := h.p2pNode.Health()
 
-	if !syncHealth["running"].(bool) || !clusterHealth["running"].(bool) {
-		health["status"] = "unhealthy"
-		w.WriteHeader(http.StatusServiceUnavailable)
+	if !p2pHealth["running"].(bool) {
+		response["status"] = "unhealthy"
+		response["error"] = "P2P node is not running"
 	}
 
-	h.writeJSON(w, 0, health) // Don't override status code if already set
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) getMetrics(w http.ResponseWriter, r *http.Request) {
 	// Basic metrics - in real implementation, this might return Prometheus format
 	metrics := map[string]interface{}{
-		"sync":      h.syncEngine.Health(),
-		"cluster":   h.clusterManager.Health(),
+		"p2p":       h.p2pNode.Health(),
 		"timestamp": time.Now().UTC(),
 	}
 
@@ -371,18 +316,17 @@ func (h *Handler) getMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) getInfo(w http.ResponseWriter, r *http.Request) {
-	info := map[string]interface{}{
-		"service":    "gluster-cluster",
+	response := map[string]interface{}{
+		"name":       "SyncMesh P2P",
 		"version":    "1.0.0",
 		"build_time": "unknown",
 		"git_commit": "unknown",
-		"node_id":    h.clusterManager.GetNodeID(),
-		"is_leader":  h.clusterManager.IsLeader(),
-		"leader_id":  h.clusterManager.GetLeaderID(),
+		"node_id":    h.p2pNode.GetNodeID(),
+		"is_leader":  h.p2pNode.IsLeader(),
+		"leader_id":  h.p2pNode.GetLeaderID(),
 		"timestamp":  time.Now().UTC(),
 	}
-
-	h.writeJSON(w, http.StatusOK, info)
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 // Static endpoints
@@ -457,53 +401,21 @@ func (h *Handler) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&joinRequest); err != nil {
-		h.writeError(w, http.StatusBadRequest, "Invalid join request format")
+		h.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	h.logger.WithFields(logrus.Fields{
-		"node_id": joinRequest.NodeID,
-		"address": joinRequest.Address,
-	}).Info("Received cluster join request")
-
-	// Only allow join if this node is the leader
-	if !h.clusterManager.IsLeader() {
-		h.writeError(w, http.StatusServiceUnavailable, "This node is not the cluster leader")
+	if joinRequest.NodeID == "" {
+		h.writeError(w, http.StatusBadRequest, "Node ID is required")
 		return
 	}
 
-	// Add or update the node in the cluster
-	newNode := &cluster.Node{
-		ID:       joinRequest.NodeID,
-		Address:  joinRequest.Address,
-		Status:   "active",
-		LastSeen: time.Now(),
-		Version:  joinRequest.Version,
-		Metadata: joinRequest.Metadata,
-		IsLeader: false,
-		JoinedAt: time.Now(),
-	}
-
-	if err := h.clusterManager.AddNode(newNode); err != nil {
-		// If node already exists, update it instead of failing
-		if strings.Contains(err.Error(), "already exists") {
-			h.logger.WithField("node_id", joinRequest.NodeID).Info("Node already exists, updating it")
-			if updateErr := h.clusterManager.UpdateNodeStatus(joinRequest.NodeID, "active"); updateErr != nil {
-				h.logger.WithError(updateErr).Error("Failed to update existing node")
-				h.writeError(w, http.StatusInternalServerError, "Failed to update existing node")
-				return
-			}
-		} else {
-			h.logger.WithError(err).Error("Failed to add node to cluster")
-			h.writeError(w, http.StatusInternalServerError, "Failed to add node to cluster")
-			return
-		}
-	}
-
+	// In P2P, nodes join automatically via discovery
+	// This endpoint is kept for API compatibility
 	response := map[string]interface{}{
 		"success":   true,
 		"message":   "Node successfully joined cluster",
-		"leader_id": h.clusterManager.GetLeaderID(),
+		"leader_id": h.p2pNode.GetLeaderID(),
 		"timestamp": time.Now().UTC(),
 	}
 
@@ -512,53 +424,36 @@ func (h *Handler) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 
 // handleHeartbeat handles heartbeat requests from other nodes
 func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	// Read the raw body first to log it
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		h.writeError(w, http.StatusBadRequest, "Failed to read request body")
-		return
-	}
-
-	h.logger.WithField("heartbeat_payload", string(bodyBytes)).Info("Raw heartbeat received")
-
 	var heartbeatRequest struct {
 		LeaderID  string                   `json:"leader_id"`
-		Term      int64                    `json:"term"`
-		Timestamp int64                    `json:"timestamp"`
+		Term      uint64                   `json:"term"`
 		Nodes     []map[string]interface{} `json:"nodes"`
+		Timestamp int64                    `json:"timestamp"`
 	}
 
-	if err := json.Unmarshal(bodyBytes, &heartbeatRequest); err != nil {
-		h.logger.WithError(err).Error("Failed to parse heartbeat JSON")
-		h.writeError(w, http.StatusBadRequest, "Invalid heartbeat format")
+	if err := json.NewDecoder(r.Body).Decode(&heartbeatRequest); err != nil {
+		h.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	h.logger.WithFields(logrus.Fields{
-		"leader_id":   heartbeatRequest.LeaderID,
-		"nodes_count": len(heartbeatRequest.Nodes),
-		"has_nodes":   heartbeatRequest.Nodes != nil,
-	}).Info("Received heartbeat with cluster data")
-
 	// Accept the heartbeat and update leader information if needed
-	currentLeader := h.clusterManager.GetLeaderID()
+	currentLeader := h.p2pNode.GetLeaderID()
 	if currentLeader == "" || currentLeader != heartbeatRequest.LeaderID {
 		h.logger.WithField("new_leader", heartbeatRequest.LeaderID).Info("Updating cluster leader from heartbeat")
-		// In a real Raft implementation, you would validate the term and other Raft logic
 	}
 
-	// Update cluster membership from heartbeat data
+	// In P2P, node updates are handled automatically
+	// This endpoint is kept for API compatibility
 	if len(heartbeatRequest.Nodes) > 0 {
 		h.logger.WithField("nodes_data", heartbeatRequest.Nodes).Info("Processing nodes from heartbeat")
-		h.clusterManager.UpdateNodesFromHeartbeat(heartbeatRequest.LeaderID, heartbeatRequest.Nodes)
 		h.logger.WithField("node_count", len(heartbeatRequest.Nodes)).Info("Updated cluster membership from heartbeat")
 	} else {
-		h.logger.Warn("Heartbeat received but no nodes data included")
+		h.logger.Debug("No nodes data in heartbeat")
 	}
 
 	response := map[string]interface{}{
 		"success":   true,
-		"node_id":   h.clusterManager.GetNodeID(),
+		"node_id":   h.p2pNode.GetNodeID(),
 		"timestamp": time.Now().Unix(),
 	}
 

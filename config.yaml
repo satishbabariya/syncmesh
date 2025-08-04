@@ -1,57 +1,92 @@
-# SyncMesh - Enterprise Distributed File Synchronization Configuration
+# SyncMesh Configuration
 
 # Application settings
+config_file: "config.yaml"
 log_level: "info"
-node_id: ""  # Auto-generated if empty
+node_id: "node-1"
 
-# Server configuration
+# Server settings
 server:
   host: "0.0.0.0"
   port: 8080
-  grpc_port: 8081
-  read_timeout: "30s"
-  write_timeout: "30s"
-  idle_timeout: "60s"
+  grpc_port: 9090
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 60s
 
-# File synchronization settings
+# Sync settings
 sync:
-  interval: "30s"
+  interval: 5s
   batch_size: 100
   max_retries: 3
-  retry_backoff: "5s"
-  conflict_resolution: "timestamp"  # timestamp, size, manual
-  checksum_algorithm: "sha256"      # sha256, md5
+  retry_backoff: 1s
+  conflict_resolution: "timestamp"
+  checksum_algorithm: "sha256"
   compression_enabled: true
   compression_level: 6
   exclude_patterns:
-    - ".tmp"
-    - ".log"
-    - ".lock"
     - "*.tmp"
-  include_patterns: []
+    - "*.log"
+    - ".git"
+  include_patterns:
+    - "*.txt"
+    - "*.json"
+    - "*.yaml"
 
-# Cluster configuration
+# P2P settings (new)
+p2p:
+  enabled: true
+  host: "0.0.0.0"
+  port: 4001
+  
+  # Discovery settings
+  discovery:
+    mdns: true
+    dht: false
+    bootstrap_peers: []
+  
+  # Pubsub settings
+  pubsub:
+    file_sync_topic: "syncmesh-file-sync"
+    cluster_topic: "syncmesh-cluster"
+  
+  # Security settings
+  security:
+    enabled: false
+    private_key: ""
+    allowed_peers: []
+  
+  # File sync settings
+  file_sync:
+    conflict_resolution: "timestamp"
+    compression: true
+    chunk_size: 1048576
+    max_file_size: 1073741824
+  
+  # Cluster coordination settings
+  cluster:
+    heartbeat_interval: 30s
+    election_timeout: 5s
+    consensus_timeout: 10s
+
+# Cluster settings (legacy - kept for compatibility)
 cluster:
-  mode: "raft"                    # raft, consul, etcd
+  mode: "p2p"  # Changed from "raft" to "p2p"
   raft_data_dir: "./data/raft"
-  bind_addr: "127.0.0.1:8082"
-  advertise_addr: ""              # Auto-detected if empty
-  bootstrap: false
+  bind_addr: "0.0.0.0:8300"
+  advertise_addr: "0.0.0.0:8300"
+  bootstrap: true
   join_addresses: []
-  heartbeat_timeout: "1s"
-  election_timeout: "1s"
-  
-  # Consul configuration (if mode is consul)
-  consul_address: "127.0.0.1:8500"
+  heartbeat_timeout: 1s
+  election_timeout: 1s
+  consul_address: "localhost:8500"
   consul_token: ""
-  
-  # etcd configuration (if mode is etcd)
   etcd_endpoints:
-    - "127.0.0.1:2379"
+    - "localhost:2379"
   etcd_username: ""
   etcd_password: ""
 
-# Security configuration
+# Security settings
 security:
   tls_enabled: false
   tls_cert_file: ""
@@ -62,29 +97,31 @@ security:
   jwt_secret: ""
   encryption_key: ""
 
-# Monitoring configuration
+# Monitoring settings
 monitoring:
   enabled: true
   metrics_path: "/metrics"
-  metrics_port: 9090
+  metrics_port: 9091
   health_path: "/health"
   prometheus_enabled: true
-  health_check_interval: "30s"
-  health_check_timeout: "5s"
+  health_check_interval: 30s
+  health_check_timeout: 5s
 
-# Docker configuration
+# Docker settings
 docker:
   socket_path: "/var/run/docker.sock"
   api_version: "1.41"
-  watched_volumes: []
-  volume_prefix: "sync-"
-  container_timeout: "30s"
+  watched_volumes:
+    - "sync-data"
+    - "app-data"
+  volume_prefix: "syncmesh_"
+  container_timeout: 30s
 
-# Storage configuration
+# Storage settings
 storage:
   data_dir: "./data"
-  temp_dir: "/tmp/gluster-cluster"
-  max_file_size: 1073741824      # 1GB
-  disk_space_limit: 10737418240  # 10GB
+  temp_dir: "./temp"
+  max_file_size: 1073741824
+  disk_space_limit: 107374182400
   cleanup_enabled: true
-  cleanup_interval: "1h"
+  cleanup_interval: 1h
